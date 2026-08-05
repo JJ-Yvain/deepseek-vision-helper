@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ZCode Vision Hook —— 给纯文本模型（DeepSeek 等）装上"眼睛"。
+
+触发时机：UserPromptSubmit（用户提交消息时，若消息里带粘贴/拖入的图片）。
+流程：
+  1. 从 stdin 读取 ZCode 注入的 JSON（session_id / transcript_path / prompt ...）
+  2. 解析临时 transcript，取【最新一条用户消息】里的全部图片
+     （file part / Anthropic 内联 base64 / zcode-artifact:// URI，三种形态都兼容）
+  3. 解析 zcode-artifact:// 到 ~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt（内容即 data URI）
+  4. 按路由规则选择视觉后端，逐张识别（见"路由"）
+  5. stdout 输出 {"additionalContext": "[Vision result] ..."} 注入对话上下文
+
+路由（config.json 可调）：
+  - 1 ~ batch_threshold 张  → provider（默认 zhipu / 免费 GLM-4.6V-Flash），失败降级 fallback_provider
+  - 超过 batch_threshold 张 → batch_provider（默认 mimo / 小米 MiMo-V2.5），失败降级 fallback_provider
+  - 环境变量 VISION_PROVIDER=xxx 可强制只用某 provider（调试用）
+  - 环境变量 VISION_CONFIG=/path/to/config.json 可指定配置文件（测试用）
+
+安全：API key 只存放在 config.json（不要提交到仓库）。
+行为：无图 / 全部识别失败时静默退出（无输出、exit 0），不影响正常对话。
+调试：运行日志写入同目录 vision_hook.log。
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LOG = os.path.join(_HERE, "vision_hook.log")
+
+
+def log(msg):
+    try:
+        with open(_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + msg + "\n")
+    except Exception:
+        pass
+
+
+def load_config():
+    path = os.environ.get("VISION_CONFIG") or os.path.join(_HERE, "config.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_transcript(path):
+    """把 transcript 解析为消息列表 [{'role','texts','images'}]，容忍多种序列化格式。"""
+    messages = []
+    if not path or not os.path.exists(path):
+        return messages
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            msg = {"role": obj.get("role", "unknown"), "texts": [], "images": []}
+
+            def scan(node):
+                if isinstance(node, dict):
+                    t = node.get("type")
+                    if t == "file" and str(node.get("mime", "")).startswith("image/"):
+                        msg["images"].append(node)
+                    elif t == "image":  # Anthropic 风格内联图片
+                        msg["images"].append(node)
+                    elif t == "text" and node.get("text"):
+                        msg["texts"].append(str(node["text"]))
+                    else:
+                        for v in node.values():
+                            scan(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        scan(v)
+
+            scan(obj)
+            messages.append(msg)
+    return messages
+
+
+def read_uri_file(path, mime):
+    """读取 artifacts 里的附件文件（内容是 data URI 或裸 base64），规整成 data URI。"""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        content = f.read().strip()
+    if content.startswith("data:"):
+        return content
+    if content.startswith("base64,"):
+        return "data:%s;%s" % (mime, content)
+    return "data:%s;base64,%s" % (mime, content)
+
+
+def resolve_image(info, session_id, cfg):
+    """把图片信息解析成 (mime, data_uri)；无法解析返回 None。"""
+    mime = info.get("mime") or "image/png"
+    url = info.get("url") or ""
+
+    # 1) Anthropic 风格内联 base64 / data URI
+    src = info.get("source")
+    if isinstance(src, dict):
+        if src.get("type") == "base64" and src.get("data"):
+            return mime, "data:%s;base64,%s" % (mime, src["data"])
+        d = src.get("data")
+        if d and str(d).startswith("data:"):
+            return mime, d
+
+    # 2) 直接内联 data URI
+    if str(url).startswith("data:"):
+        return mime, url
+
+    # 3) zcode-artifact:// URI → 磁盘 artifacts 目录
+    if str(url).startswith("zcode-artifact://"):
+        rest = url[len("zcode-artifact://"):]
+        parts = rest.split("/", 1)
+        sess = parts[0] or session_id
+        name = parts[1] if len(parts) > 1 else ""
+        base = os.path.expanduser(cfg.get("artifacts_dir", "~/.zcode/cli/artifacts"))
+        d = os.path.join(base, sess)
+        if not name or not os.path.isdir(d):
+            return None
+        # 优先：文件名包含 URI 尾部（实测格式 prompt-attachment-upload-*-<tail>.txt）
+        for fn in os.listdir(d):
+            if fn.endswith(".txt") and name in fn:
+                return mime, read_uri_file(os.path.join(d, fn), mime)
+        # 兜底：该会话最新的粘贴附件
+        cands = [fn for fn in os.listdir(d)
+                 if fn.startswith("prompt-attachment-upload") and fn.endswith(".txt")]
+        if cands:
+            newest = max(cands, key=lambda fn: os.path.getmtime(os.path.join(d, fn)))
+            return mime, read_uri_file(os.path.join(d, newest), mime)
+    return None
+
+
+def newest_fresh_artifacts(session_id, cfg, max_n=1):
+    """transcript 里找不到图时兜底：取该会话最近 fresh_seconds 秒内的粘贴附件。
+
+    返回 [(mime, data_uri), ...]，按新旧倒序，最多 max_n 张。
+    """
+    base = os.path.expanduser(cfg.get("artifacts_dir", "~/.zcode/cli/artifacts"))
+    d = os.path.join(base, session_id or "")
+    if not os.path.isdir(d):
+        return []
+    fresh = cfg.get("fresh_seconds", 300)
+    now = time.time()
+    cands = [fn for fn in os.listdir(d)
+             if fn.startswith("prompt-attachment-upload") and fn.endswith(".txt")
+             and now - os.path.getmtime(os.path.join(d, fn)) <= fresh]
+    cands.sort(key=lambda fn: os.path.getmtime(os.path.join(d, fn)), reverse=True)
+    return [("image/png", read_uri_file(os.path.join(d, fn), "image/png"))
+            for fn in cands[:max_n]]
+
+
+_PLACEHOLDER_RE = None  # 延迟初始化（避免 import 顺序问题）
+
+
+def count_placeholder_images(texts):
+    """统计最新用户消息文本里的图片占位符标记（如 [Attached image/png: image.png]）。
+
+    当图片因主模型不支持图片输入而被裁剪成纯文本时，transcript 里只剩这种标记，
+    但实际附件仍会落盘到 artifacts 目录——靠它触发兜底取图（保证"发图必识别"）。
+    """
+    global _PLACEHOLDER_RE
+    if _PLACEHOLDER_RE is None:
+        import re
+        _PLACEHOLDER_RE = re.compile(r"\[Attached image[^\]]*\]", re.IGNORECASE)
+    n = 0
+    for t in texts:
+        n += len(_PLACEHOLDER_RE.findall(t or ""))
+    return n
+
+
+def call_vision(cfg, data_uri, question, provider):
+    """调用 OpenAI 兼容 /chat/completions，返回识别文本；失败返回 None。"""
+    providers = cfg.get("providers", {})
+    if provider not in providers:
+        log("provider missing in config: %s" % provider)
+        return None
+    p = providers[provider]
+    payload = {
+        "model": p["model"],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question or cfg.get(
+                    "default_question",
+                    "请识别这张图片：如果包含文字请完整提取；如果是界面、报错页面或图表，请说明其内容与含义。")},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }],
+        "max_tokens": cfg.get("max_tokens", 1500),
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "zcode-vision-hook/1.0",
+    }
+    headers[p.get("header", "Authorization")] = p.get("auth_prefix", "") + p["api_key"]
+    body = json.dumps(payload).encode("utf-8")
+    last_err = "unknown"
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(p["base_url"], data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=cfg.get("timeout_seconds", 90)) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return str(data["choices"][0]["message"]["content"]).strip()
+        except urllib.error.HTTPError as e:
+            last_err = "HTTP %s: %s" % (e.code, e.read(300).decode("utf-8", "replace"))
+            retry = e.code in (429, 500, 502, 503, 504) or "1302" in last_err or "1305" in last_err
+            if not retry:
+                break
+            time.sleep(2)
+        except Exception as e:
+            last_err = str(e)[:300]
+            if attempt == 0:
+                time.sleep(2)
+    log("vision api failed (%s): %s" % (provider, last_err))
+    return None
+
+
+def build_chain(cfg):
+    """按路由规则返回 provider 链（保序去重）。"""
+    forced = os.environ.get("VISION_PROVIDER")
+    if forced:
+        return [forced]
+    threshold = cfg.get("batch_threshold", 3)
+    return [cfg.get("provider", "zhipu"), cfg.get("fallback_provider", "mimo")]
+
+
+def main():
+    raw = sys.stdin.read().strip()
+    if not raw:
+        return
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return
+    session_id = payload.get("session_id", "")
+    log("hook fired: event=%s session=%s" % (payload.get("hook_event_name"), session_id))
+
+    cfg = load_config()
+    msgs = parse_transcript(payload.get("transcript_path"))
+    log("transcript=%s msgs=%d" % (payload.get("transcript_path"), len(msgs)))
+
+    # 1) 收集本消息内的全部图片
+    img_infos = []
+    target_texts = []
+    if msgs and msgs[-1].get("images"):
+        img_infos = msgs[-1]["images"]
+        target_texts = msgs[-1]["texts"]
+    if msgs and not img_infos:
+        target_texts = msgs[-1]["texts"]  # 无图时也记录文本，供占位符检测
+
+    # 2) 逐张解析成 data URI（单张解析失败不影响其他张）
+    resolved = []
+    for info in img_infos:
+        r = resolve_image(info, session_id, cfg)
+        if r:
+            resolved.append(r)
+        else:
+            log("image resolve failed for one part")
+
+    # 3) 兜底：transcript 里图片被裁剪成 [Attached image...] 文本占位符时，
+    #    按标记数量从 artifacts 目录取最近 N 张附件（"发图必识别"的关键修复）。
+    if not resolved:
+        n_ph = count_placeholder_images(target_texts)
+        if n_ph:
+            log("placeholder detected: %d image marker(s) in latest user message" % n_ph)
+            max_n = min(n_ph, cfg.get("max_images", 4))
+            resolved = newest_fresh_artifacts(session_id, cfg, max_n)
+            if resolved:
+                log("fallback resolved %d artifact(s)" % len(resolved))
+    if not resolved:
+        log("no image found")
+        return
+
+    # 4) 体积保护 + 数量上限
+    kept = []
+    for mime, data_uri in resolved:
+        est = len(data_uri) * 3 // 4  # data URI 长度 ≈ base64 长度 → 字节数估算
+        if est > cfg.get("max_image_bytes", 10 * 1024 * 1024):
+            log("image too large: ~%d bytes" % est)
+            continue
+        kept.append((mime, data_uri))
+    total_in = len(kept)
+    max_images = cfg.get("max_images", 4)
+    if len(kept) > max_images:
+        log("batch truncated: %d -> %d" % (len(kept), max_images))
+        kept = kept[:max_images]
+    if not kept:
+        return
+
+    # 5) 路由：单图用默认 provider；超过阈值整批用 batch_provider
+    threshold = cfg.get("batch_threshold", 3)
+    if len(kept) > threshold:
+        chain = [cfg.get("batch_provider", "mimo"), cfg.get("fallback_provider", "mimo")]
+    else:
+        chain = [cfg.get("provider", "zhipu"), cfg.get("fallback_provider", "mimo")]
+    forced = os.environ.get("VISION_PROVIDER")
+    if forced:
+        chain = [forced]
+    chain = list(dict.fromkeys(p for p in chain if p))
+    log("routing: %d image(s), chain=%s" % (len(kept), chain))
+
+    question = payload.get("prompt") or (target_texts[-1] if target_texts else None)
+    per_cap = cfg.get("per_image_max_chars", 800)
+    total_cap = cfg.get("total_max_chars", 4000)
+
+    parts = []
+    used = set()
+    multi = len(kept) > 1
+    for i, (mime, data_uri) in enumerate(kept, 1):
+        q = ("图%d。%s" % (i, question)) if multi else question
+        ok = False
+        for prov in chain:
+            desc = call_vision(cfg, data_uri, q, prov)
+            if desc:
+                used.add(prov)
+                parts.append(("图%d: " % i) + desc[:per_cap] if multi else desc[:per_cap])
+                ok = True
+                break
+        if not ok:
+            parts.append("图%d: (识别失败)" % i)
+            log("all providers failed for image %d" % i)
+
+    successes = [p for p in parts if not p.endswith("(识别失败)")]
+    if not successes:
+        log("no vision result at all")
+        return
+
+    result = "\n".join(parts)
+    if total_in > len(kept):
+        result += "\n（共 %d 张图，已识别前 %d 张）" % (total_in, len(kept))
+    result = result[:total_cap]
+    log("vision ok: %d image(s), %d chars, providers=%s" % (len(kept), len(result), ",".join(sorted(used))))
+    print(json.dumps({"additionalContext": "[Vision result] " + result}, ensure_ascii=False))
+
+
+def collect_files(folder, files):
+    """收集待识别图片文件（目录递归 + 显式文件列表，去重保序）。"""
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    result = []
+    if folder:
+        for root, _, names in os.walk(folder):
+            for n in sorted(names):
+                if os.path.splitext(n)[1].lower() in exts:
+                    result.append(os.path.join(root, n))
+    if files:
+        result.extend(os.path.abspath(f) for f in files if os.path.isfile(f))
+    seen, out = set(), []
+    for f in result:
+        rp = os.path.realpath(f)
+        if rp not in seen:
+            seen.add(rp)
+            out.append(f)
+    return out
+
+
+def mime_for(path):
+    return {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}.get(
+        os.path.splitext(path)[1].lower().lstrip("."), "image/png")
+
+
+def file_to_data_uri(path, mime):
+    import base64
+    with open(path, "rb") as f:
+        raw = f.read()
+    return "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
+
+
+def run_folder_mode(cfg, files, question, out_path, chain, per_cap):
+    """批量识别：逐张调用（串行），结果写文件或打印。返回 None（写文件）或文本。"""
+    lines, ok_count = [], 0
+    for i, path in enumerate(files, 1):
+        name = os.path.basename(path)
+        mime = mime_for(path)
+        try:
+            data_uri = file_to_data_uri(path, mime)
+        except Exception as e:
+            lines.append("%d. **%s** — (读取失败: %s)" % (i, name, e))
+            continue
+        if len(data_uri) * 3 // 4 > cfg.get("max_image_bytes", 10 * 1024 * 1024):
+            lines.append("%d. **%s** — (超出大小限制)" % (i, name))
+            continue
+        desc = None
+        for prov in chain:
+            desc = call_vision(cfg, data_uri, question, prov)
+            if desc:
+                break
+        if desc:
+            ok_count += 1
+            lines.append("%d. **%s** — %s" % (i, name, desc[:per_cap]))
+        else:
+            lines.append("%d. **%s** — (识别失败)" % (i, name))
+        log("folder mode: %d/%d done (ok=%d)" % (i, len(files), ok_count))
+    text = "\n".join(lines)
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("# 批量识图结果（共 %d 张，成功 %d 张）\n\n%s\n" % (len(files), ok_count, text))
+        log("folder mode done: %d files -> %s (ok %d)" % (len(files), out_path, ok_count))
+        return None
+    return text
+
+
+def main_cli(argv):
+    import argparse
+    ap = argparse.ArgumentParser(description="ZCode Vision Hook 批量识图模式（路由与 hook 一致）")
+    ap.add_argument("--folder", help="扫描并识别目录下所有图片（递归）")
+    ap.add_argument("--files", nargs="*", help="指定图片文件列表")
+    ap.add_argument("--out", help="结果写入文件（推荐；不写则打印到 stdout）")
+    ap.add_argument("--provider", help="强制使用某 provider（如 mimo/zhipu）")
+    ap.add_argument("--max", type=int, default=0, help="最多识别张数（0=不限）")
+    ap.add_argument("--question", default=None, help="识别问题（默认用 config 的 default_question）")
+    args = ap.parse_args(argv)
+    if not args.folder and not args.files:
+        ap.error("需要 --folder 或 --files")
+    cfg = load_config()
+    files = collect_files(args.folder, args.files)
+    if args.max > 0:
+        files = files[:args.max]
+    if not files:
+        print("未找到图片文件")
+        return
+    # 路由与 hook 一致：超过 batch_threshold 张走 batch_provider，失败降级 fallback_provider
+    threshold = cfg.get("batch_threshold", 3)
+    if args.provider:
+        chain = [args.provider]
+    elif len(files) > threshold:
+        chain = [cfg.get("batch_provider", "mimo"), cfg.get("fallback_provider", "mimo")]
+    else:
+        chain = [cfg.get("provider", "zhipu"), cfg.get("fallback_provider", "mimo")]
+    chain = list(dict.fromkeys(p for p in chain if p))
+    log("folder mode: %d file(s), chain=%s" % (len(files), chain))
+    question = args.question or cfg.get("default_question")
+    text = run_folder_mode(cfg, files, question, args.out, chain, cfg.get("per_image_max_chars", 800))
+    if text is not None:
+        print(text)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        main_cli(sys.argv[1:])
+    else:
+        main()
