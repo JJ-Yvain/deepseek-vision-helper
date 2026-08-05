@@ -12,12 +12,17 @@
 ## 工作原理
 
 ```
-粘贴图片 + 提问 → UserPromptSubmit Hook → 从 transcript 取图片 → 调视觉 API → 结果注入上下文 → 文本模型回答
+粘贴图片 + 提问 → UserPromptSubmit / PreToolUse Hook → 检测新落盘附件 → 调视觉 API → 结果注入上下文 → 文本模型回答
 ```
 
-- **Hook 事件**：`UserPromptSubmit`（每次用户提交消息时触发，无图时静默跳过，开销约 0.2 秒）
-- **取图**：解析 ZCode 临时 transcript 中的图片 part；`zcode-artifact://` URI 映射到
-  `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt`（内容即 data URI）
+- **Hook 事件**：`UserPromptSubmit` + `PreToolUse` 双事件（任一触发都会尝试取图；state 记账
+  保证同一批图只注入一次；无图时静默跳过，开销约 0.2 秒）
+- **取图（state 增量附件监控）**：粘贴的图片附件会落盘到
+  `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt`（内容即 data URI）。
+  脚本每次运行对比 `vision_hook_state.json`（同目录自动生成）中的已识别记录，
+  只识别**新落盘**的附件。之所以不依赖 transcript：ZCode 的 hook transcript 只含纯文本
+  （UserPromptSubmit 仅 prompt、PreToolUse 为空），图片 part 永远不会出现在 transcript 里，
+  附件增量监控是贴图识别的唯一可靠通道。
 - **注入**：stdout 输出 `{"additionalContext": "[Vision result] ..."}`
 - **失败静默**：无图 / 接口报错 → 空输出（exit 0），不影响对话
 
@@ -32,6 +37,9 @@ deepseek-vision-helper/
     ├── vision_hook.py        # Hook 脚本（Python 3，仅标准库）
     └── config.example.json   # 配置示例：复制为 config.json 后填入自己的 API key
 ```
+
+> `vision_hook_state.json` 与 `vision_hook.log` 在脚本运行时自动生成于 hook 目录
+> （已识别附件记账 / 调试日志，均不含密钥，勿提交仓库）。
 
 ## 安装
 
@@ -58,7 +66,8 @@ cp ~/.zcode/vision-hook/config.example.json ~/.zcode/vision-hook/config.json
 
 ### 3. 注册 hook（ZCode）
 
-编辑 `~/.zcode/cli/config.json`（或工作区 `.zcode/config.json`），在 `hooks` 字段加入：
+编辑 `~/.zcode/cli/config.json`（或工作区 `.zcode/config.json`），在 `hooks` 字段加入
+（建议 `UserPromptSubmit` + `PreToolUse` 双事件挂载，双保险）：
 
 ```json
 {
@@ -77,12 +86,26 @@ cp ~/.zcode/vision-hook/config.example.json ~/.zcode/vision-hook/config.json
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/path/to/python3",
+            "args": ["/path/to/vision_hook.py"],
+            "timeoutMs": 300000
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-> 配置文件的 hook 需要 `hooks.enabled: true` 才会执行。改动即时生效。
+> 配置文件的 hook 需要 `hooks.enabled: true` 才会执行。事件配置在会话启动时加载，
+> 新增/修改事件后需重启客户端生效。
 
 ### 4. 验证
 
@@ -157,10 +180,10 @@ python3 vision_hook.py --folder "图片目录" --provider mimo --max 20 --out re
 ## 故障排查
 
 1. **完全不生效**：查看 `vision_hook.log`（脚本同目录）是否有 `hook fired`；没有说明
-   hook 没被调用（检查 `hooks.enabled: true` 与事件名/匹配器）。
-2. **`no image found`**：transcript 里没解析到图片。如果确认贴了图，可能是
-   UserPromptSubmit 时新消息尚未写入 transcript —— 改挂 `PreToolUse` 事件
-   （脚本无需改动，事件名只用于日志）。
+   hook 没被调用（检查 `hooks.enabled: true` 与事件名/匹配器，新增事件后需重启客户端）。
+2. **`no image found`**：没有检测到新落盘的图片附件。确认贴图后附件会写入
+   `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt`；若文件存在但未识别，
+   检查 `vision_hook_state.json` 是否已记录该文件（同一张图只识别一次，属正常行为）。
 3. **`vision api failed`**：看具体错误；`1305` 是平台过载，稍后重试即可；401 是 key 无效。
 4. **skill 不触发**：确认 `SKILL.md` frontmatter 的 `description` 中存在
    `[Vision result]` 触发词，且 skill 位于发现根目录（见上文安装表）。

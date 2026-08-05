@@ -3,14 +3,20 @@
 """
 ZCode Vision Hook —— 给纯文本模型（DeepSeek 等）装上"眼睛"。
 
-触发时机：UserPromptSubmit（用户提交消息时，若消息里带粘贴/拖入的图片）。
+触发时机：UserPromptSubmit / PreToolUse（任一事件触发都会尝试取图并识别）。
 流程：
-  1. 从 stdin 读取 ZCode 注入的 JSON（session_id / transcript_path / prompt ...）
-  2. 解析临时 transcript，取【最新一条用户消息】里的全部图片
-     （file part / Anthropic 内联 base64 / zcode-artifact:// URI，三种形态都兼容）
-  3. 解析 zcode-artifact:// 到 ~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt（内容即 data URI）
-  4. 按路由规则选择视觉后端，逐张识别（见"路由"）
-  5. stdout 输出 {"additionalContext": "[Vision result] ..."} 注入对话上下文
+  1. 从 stdin 读取 ZCode 注入的 JSON（session_id / transcript_path / prompt / tool_name ...）
+  2. 取图（按优先级）：
+     a. transcript 里的图片 part（file / Anthropic 内联 base64 / zcode-artifact:// URI）
+     b. transcript 用户文本里的 [Attached image...] 占位符 → artifacts 兜底
+     c. 【核心】state 增量监控：扫描 ~/.zcode/cli/artifacts/<会话>/ 下新落盘的
+        prompt-attachment-upload-*.txt（与 vision_hook_state.json 中已识别记录对比，
+        只识别新文件，天然去重）——ZCode 的 hook transcript 只含纯文本（UserPromptSubmit
+        仅 prompt、PreToolUse 为空），图片 part 永远不会出现在 transcript 里，
+        因此附件增量监控是贴图识别的唯一可靠通道。
+  3. 按路由规则选择视觉后端，逐张识别（见"路由"）
+  4. stdout 输出 {"additionalContext": "[Vision result] ..."} 注入对话上下文
+  5. 至少一张识别成功后，把本次识别的附件记入 state（下次不再重复注入）
 
 路由（config.json 可调）：
   - 1 ~ batch_threshold 张  → provider（默认 zhipu / 免费 GLM-4.6V-Flash），失败降级 fallback_provider
@@ -31,6 +37,7 @@ import urllib.request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LOG = os.path.join(_HERE, "vision_hook.log")
+_STATE_FILE = os.path.join(_HERE, "vision_hook_state.json")
 
 
 def log(msg):
@@ -138,23 +145,69 @@ def resolve_image(info, session_id, cfg):
     return None
 
 
-def newest_fresh_artifacts(session_id, cfg, max_n=1):
-    """transcript 里找不到图时兜底：取该会话最近 fresh_seconds 秒内的粘贴附件。
+# ---------- state 增量附件监控（贴图识别的核心通道） ----------
+# ZCode 的 hook transcript 只含纯文本（UserPromptSubmit 仅 prompt、PreToolUse 为空），
+# 图片 part 永远不会出现在 transcript 里；粘贴的图片附件会落盘到
+# ~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt。
+# 因此：记录"已识别附件"状态，每次 hook 只识别新落盘的附件，可靠且天然去重。
 
-    返回 [(mime, data_uri), ...]，按新旧倒序，最多 max_n 张。
-    """
+
+def load_state():
+    try:
+        with open(_STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+            return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        tmp = _STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, _STATE_FILE)  # 原子替换，避免半写状态
+    except Exception:
+        pass
+
+
+def list_attachments(session_id, cfg):
+    """列出该会话 artifacts 目录下全部粘贴附件，返回 [(filename, mtime, abspath)]（按新旧升序）。"""
     base = os.path.expanduser(cfg.get("artifacts_dir", "~/.zcode/cli/artifacts"))
     d = os.path.join(base, session_id or "")
     if not os.path.isdir(d):
         return []
-    fresh = cfg.get("fresh_seconds", 300)
-    now = time.time()
-    cands = [fn for fn in os.listdir(d)
-             if fn.startswith("prompt-attachment-upload") and fn.endswith(".txt")
-             and now - os.path.getmtime(os.path.join(d, fn)) <= fresh]
-    cands.sort(key=lambda fn: os.path.getmtime(os.path.join(d, fn)), reverse=True)
-    return [("image/png", read_uri_file(os.path.join(d, fn), "image/png"))
-            for fn in cands[:max_n]]
+    out = []
+    for fn in os.listdir(d):
+        if fn.startswith("prompt-attachment-upload") and fn.endswith(".txt"):
+            p = os.path.join(d, fn)
+            try:
+                out.append((fn, os.path.getmtime(p), p))
+            except OSError:
+                continue
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def new_attachments(session_id, cfg, state, max_n):
+    """返回 state 未记录（或 mtime 已变化）的附件 [(fn, mtime, path)]，按新旧倒序，最多 max_n。
+
+    附件在用户粘贴图片时即落盘，与提交时机无关：只要它在上一次 hook 运行之后
+    出现（state 未记录），本次就会被识别——"发图必识别、已识别不重复"。
+    """
+    files = list_attachments(session_id, cfg)
+    known = state.get(session_id, {}) if isinstance(state, dict) else {}
+    new = [(fn, mt, p) for fn, mt, p in files if known.get(fn) != mt]
+    new.sort(key=lambda x: x[1], reverse=True)
+    return new[:max_n]
+
+
+def mark_identified(state, session_id, attachments):
+    """把已成功识别的附件记入 state（filename -> mtime）。"""
+    known = state.get(session_id, {})
+    for fn, mt, _ in attachments:
+        known[fn] = mt
+    state[session_id] = known
 
 
 _PLACEHOLDER_RE = None  # 延迟初始化（避免 import 顺序问题）
@@ -245,6 +298,7 @@ def main():
     log("hook fired: event=%s session=%s" % (payload.get("hook_event_name"), session_id))
 
     cfg = load_config()
+    state = load_state()
     msgs = parse_transcript(payload.get("transcript_path"))
     log("transcript=%s msgs=%d" % (payload.get("transcript_path"), len(msgs)))
 
@@ -266,16 +320,29 @@ def main():
         else:
             log("image resolve failed for one part")
 
-    # 3) 兜底：transcript 里图片被裁剪成 [Attached image...] 文本占位符时，
-    #    按标记数量从 artifacts 目录取最近 N 张附件（"发图必识别"的关键修复）。
+    # 3) 占位符兜底：transcript 用户文本里出现 [Attached image...] 标记时，按数量取图。
+    #    （ZCode 的 hook transcript 只含纯文本，此路径通常不命中；保留以防其他客户端行为差异）
+    identified = []  # 本次识别成功的附件（供 state 记账去重）
     if not resolved:
         n_ph = count_placeholder_images(target_texts)
         if n_ph:
-            log("placeholder detected: %d image marker(s) in latest user message" % n_ph)
+            log("placeholder detected: %d image marker(s)" % n_ph)
             max_n = min(n_ph, cfg.get("max_images", 4))
-            resolved = newest_fresh_artifacts(session_id, cfg, max_n)
-            if resolved:
-                log("fallback resolved %d artifact(s)" % len(resolved))
+            atts = new_attachments(session_id, cfg, state, max_n)
+            if atts:
+                log("placeholder resolved %d attachment(s)" % len(atts))
+                resolved = [("image/png", read_uri_file(p, "image/png")) for _, _, p in atts]
+                identified = atts
+
+    # 4) 【核心】state 增量附件监控：transcript 拿不到图（UserPromptSubmit 仅纯文本
+    #    prompt、PreToolUse 为空 transcript），改从 artifacts 目录识别"新落盘"的附件，
+    #    与已识别记录对比，可靠且天然去重——"发图必识别"。
+    if not resolved:
+        atts = new_attachments(session_id, cfg, state, cfg.get("max_images", 4))
+        if atts:
+            log("new attachment(s) detected: %d (state-based)" % len(atts))
+            resolved = [("image/png", read_uri_file(p, "image/png")) for _, _, p in atts]
+            identified = atts
     if not resolved:
         log("no image found")
         return
@@ -333,6 +400,13 @@ def main():
     if not successes:
         log("no vision result at all")
         return
+
+    # 至少一张识别成功才记账：本次识别的附件标记为"已识别"，后续事件（如
+    # UserPromptSubmit + PreToolUse 双触发）不会重复注入同一批图。
+    if identified:
+        mark_identified(state, session_id, identified)
+        save_state(state)
+        log("state updated: %d attachment(s) marked" % len(identified))
 
     result = "\n".join(parts)
     if total_in > len(kept):
