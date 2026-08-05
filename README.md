@@ -272,6 +272,7 @@ deepseek-vision-helper/
 | `per_image_max_chars` / `total_max_chars` | 800 / 4000 | 单张/总注入长度上限 |
 | `max_image_bytes` | 10485760 | 单张图片大小上限（超出跳过） |
 | `timeout_seconds` | 90 | 单次 API 调用超时 |
+| `log_max_bytes` | 1048576 | 运行日志轮转阈值（超过后归档为 `vision_hook.log.1`，保留最近两段） |
 | `max_tokens` | 1500 | 识别结果 token 上限 |
 
 Provider 说明（OpenAI 兼容 `/chat/completions`，可自行添加任意提供商）：

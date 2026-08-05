@@ -38,10 +38,22 @@ import urllib.request
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LOG = os.path.join(_HERE, "vision_hook.log")
 _STATE_FILE = os.path.join(_HERE, "vision_hook_state.json")
+_LOG_MAX_BYTES = 1024 * 1024  # 日志轮转阈值(默认 1MB,可由 config.log_max_bytes 覆盖)
+
+
+def _rotate_log():
+    """当前日志超过阈值时归档为 .1(覆盖旧备份),保留最近两段日志。"""
+    try:
+        if os.path.exists(_LOG):
+            os.replace(_LOG, _LOG + ".1")
+    except Exception:
+        pass
 
 
 def log(msg):
     try:
+        if _LOG_MAX_BYTES and os.path.exists(_LOG) and os.path.getsize(_LOG) >= _LOG_MAX_BYTES:
+            _rotate_log()
         with open(_LOG, "a", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + msg + "\n")
     except Exception:
@@ -321,6 +333,8 @@ def main():
     log("hook fired: event=%s session=%s" % (payload.get("hook_event_name"), session_id))
 
     cfg = load_config()
+    global _LOG_MAX_BYTES
+    _LOG_MAX_BYTES = cfg.get("log_max_bytes", 1024 * 1024)
     state = load_state()
     msgs = parse_transcript(payload.get("transcript_path"))
     log("transcript=%s msgs=%d" % (payload.get("transcript_path"), len(msgs)))
@@ -539,6 +553,8 @@ def main_cli(argv):
     if not args.folder and not args.files:
         ap.error("需要 --folder 或 --files")
     cfg = load_config()
+    global _LOG_MAX_BYTES
+    _LOG_MAX_BYTES = cfg.get("log_max_bytes", 1024 * 1024)
     guidance = config_guidance(cfg)
     if guidance:
         print(guidance)
