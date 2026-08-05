@@ -51,7 +51,30 @@ def log(msg):
 def load_config():
     path = os.environ.get("VISION_CONFIG") or os.path.join(_HERE, "config.json")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    # 环境变量覆盖 API key（优先级高于 config.json）：
+    #   VISION_API_KEY_<PROVIDER 大写、连字符转下划线>，如 VISION_API_KEY_ZHIPU / VISION_API_KEY_MIMO_DIRECT
+    for name, p in cfg.get("providers", {}).items():
+        env_key = os.environ.get("VISION_API_KEY_" + name.upper().replace("-", "_"))
+        if env_key:
+            p["api_key"] = env_key
+    return cfg
+
+
+def usable_providers(cfg):
+    """返回配置了真实 key 的 provider（剔除 YOUR_ 占位符与空值）。"""
+    return {n: p for n, p in cfg.get("providers", {}).items()
+            if p.get("api_key") and not str(p["api_key"]).startswith("YOUR_")}
+
+
+def config_guidance(cfg):
+    """未配置任何可用 key 时返回引导文案（供日志/CLI 输出），否则返回 None。"""
+    if usable_providers(cfg):
+        return None
+    return ("[vision helper] 未配置可用的 API key。两种配置方式："
+            "① 设置环境变量 VISION_API_KEY_<PROVIDER>（如 VISION_API_KEY_ZHIPU）；"
+            "② 编辑 %s 的 providers 填入真实 key（免费推荐：bigmodel.cn 注册 GLM-4.6V-Flash）"
+            % os.path.join(_HERE, "config.json"))
 
 
 def parse_transcript(path):
@@ -347,6 +370,12 @@ def main():
         log("no image found")
         return
 
+    # 未配置可用 key：日志给出明确引导（hook 保持静默退出，不注入）
+    guidance = config_guidance(cfg)
+    if guidance:
+        log(guidance)
+        return
+
     # 4) 体积保护 + 数量上限
     kept = []
     for mime, data_uri in resolved:
@@ -376,8 +405,11 @@ def main():
     log("routing: %d image(s), chain=%s" % (len(kept), chain))
 
     question = payload.get("prompt") or (target_texts[-1] if target_texts else None)
-    per_cap = cfg.get("per_image_max_chars", 800)
     total_cap = cfg.get("total_max_chars", 4000)
+    # 预算均分：多图时每张分到 total_cap/张数 的注入空间（下限 200 字符），
+    # 避免前几张图吃光预算、后面的图被整体截没。
+    per_cap = min(cfg.get("per_image_max_chars", 800),
+                  max(200, total_cap // max(len(kept), 1)))
 
     parts = []
     used = set()
@@ -389,7 +421,10 @@ def main():
             desc = call_vision(cfg, data_uri, q, prov)
             if desc:
                 used.add(prov)
-                parts.append(("图%d: " % i) + desc[:per_cap] if multi else desc[:per_cap])
+                d = desc[:per_cap]
+                if len(desc) > per_cap:
+                    d += "…(截断)"
+                parts.append(("图%d: " % i) + d if multi else d)
                 ok = True
                 break
         if not ok:
@@ -449,8 +484,11 @@ def file_to_data_uri(path, mime):
     return "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
 
 
-def run_folder_mode(cfg, files, question, out_path, chain, per_cap):
-    """批量识别：逐张调用（串行），结果写文件或打印。返回 None（写文件）或文本。"""
+def run_folder_mode(cfg, files, question, out_path, chain, per_cap, plain=False):
+    """批量识别：逐张调用（串行），结果写文件或打印。返回 None（写文件）或文本。
+
+    plain=True（单文件、无 --out）时输出纯描述文本，便于模型直接读取（主动调用模式）。
+    """
     lines, ok_count = [], 0
     for i, path in enumerate(files, 1):
         name = os.path.basename(path)
@@ -470,7 +508,10 @@ def run_folder_mode(cfg, files, question, out_path, chain, per_cap):
                 break
         if desc:
             ok_count += 1
-            lines.append("%d. **%s** — %s" % (i, name, desc[:per_cap]))
+            if plain:
+                lines.append(desc[:per_cap])
+            else:
+                lines.append("%d. **%s** — %s" % (i, name, desc[:per_cap]))
         else:
             lines.append("%d. **%s** — (识别失败)" % (i, name))
         log("folder mode: %d/%d done (ok=%d)" % (i, len(files), ok_count))
@@ -485,7 +526,9 @@ def run_folder_mode(cfg, files, question, out_path, chain, per_cap):
 
 def main_cli(argv):
     import argparse
-    ap = argparse.ArgumentParser(description="ZCode Vision Hook 批量识图模式（路由与 hook 一致）")
+    ap = argparse.ArgumentParser(
+        description="DeepSeek Vision Helper 批量识图（路由与 hook 一致）。"
+                    "支持模型主动调用：python vision_hook.py --files <图片> --question <问题>")
     ap.add_argument("--folder", help="扫描并识别目录下所有图片（递归）")
     ap.add_argument("--files", nargs="*", help="指定图片文件列表")
     ap.add_argument("--out", help="结果写入文件（推荐；不写则打印到 stdout）")
@@ -496,6 +539,10 @@ def main_cli(argv):
     if not args.folder and not args.files:
         ap.error("需要 --folder 或 --files")
     cfg = load_config()
+    guidance = config_guidance(cfg)
+    if guidance:
+        print(guidance)
+        sys.exit(1)
     files = collect_files(args.folder, args.files)
     if args.max > 0:
         files = files[:args.max]
@@ -513,7 +560,10 @@ def main_cli(argv):
     chain = list(dict.fromkeys(p for p in chain if p))
     log("folder mode: %d file(s), chain=%s" % (len(files), chain))
     question = args.question or cfg.get("default_question")
-    text = run_folder_mode(cfg, files, question, args.out, chain, cfg.get("per_image_max_chars", 800))
+    # 单文件且不落盘：输出纯描述文本（模型主动调用模式）
+    plain = len(files) == 1 and not args.out
+    text = run_folder_mode(cfg, files, question, args.out, chain,
+                           cfg.get("per_image_max_chars", 800), plain=plain)
     if text is not None:
         print(text)
 

@@ -66,8 +66,18 @@ cp hook/config.example.json ~/.zcode/vision-hook/config.json
 `mimo`/`agnes`/`mimo-direct` 可选；不用的 provider 可留占位符）。
 同时建议把 `provider` 字段设为已填 key 的那个（如 `"provider": "zhipu"`）。
 
+**也可以不改 config.json，改用环境变量**（优先级更高，适合不想在配置文件里写 key 的场景）：
+
+```bash
+export VISION_API_KEY_ZHIPU=你的智谱key
+# 或 export VISION_API_KEY_MIMO=... / VISION_API_KEY_AGNES=...
+```
+
+环境变量命名规则：`VISION_API_KEY_<PROVIDER 大写、连字符转下划线>`（如
+`mimo-direct` → `VISION_API_KEY_MIMO_DIRECT`）。设置后重启 ZCode 客户端或新终端生效。
+
 **完成标准**：`config.json` 是合法 JSON（`python3 -m json.tool config.json` 不报错），
-且至少一个 provider 的 `api_key` 不是 `YOUR_` 开头。
+且至少一个 provider 的 `api_key` 不是 `YOUR_` 开头，**或**已设置对应环境变量。
 
 ### 第 3 步：注册 hooks（ZCode 配置）
 
@@ -187,6 +197,7 @@ tail -3 ~/.zcode/vision-hook/vision_hook.log
 | 症状 | 定位与修复 |
 |---|---|
 | 日志无 `hook fired` | hook 没被调用。检查 `~/.zcode/cli/config.json` 的 `hooks.enabled: true`、事件名是否为 `UserPromptSubmit`/`PreToolUse`（大小写敏感）、`matcher` 是否合法；改配置后是否重启过客户端 |
+| `未配置可用的 API key`（日志/CLI 输出） | 没有任何 provider 的 key 可用（都是 `YOUR_` 占位符或空）。按"步骤 2"填 key，或设置 `VISION_API_KEY_<PROVIDER>` 环境变量 |
 | `no image found` | 未检测到新贴的附件。确认贴图后 `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt` 已落盘；若文件存在但未识别，检查 `vision_hook_state.json` 是否已记录（同图只识别一次，正常） |
 | `vision api failed (HTTP xxx)` | 视觉 API 调用失败。401 = key 无效（回步骤 2 检查）；1305/429/5xx = 平台过载，稍后自动重试；网络不通则检查代理 |
 | `provider missing in config` | `config.json` 的 `providers` 缺少路由使用的 provider。把 `provider`/`batch_provider`/`fallback_provider` 指向已填 key 的 provider |
@@ -278,7 +289,34 @@ Provider 说明（OpenAI 兼容 `/chat/completions`，可自行添加任意提�
 `VISION_CONFIG=/path/to/config.json` 可指定配置文件，`VISION_PROVIDER=xxx` 可强制
 provider，均用于测试。
 
+## 模型主动调用模式（无 hook 环境）
+
+在**不支持 hook 事件**的环境（其他 Agent、纯 CLI 场景）里，模型可以主动调用脚本识图——
+脚本以普通命令形式运行，输出纯文本描述，无注入、无 hooks 依赖：
+
+```bash
+# 单图 + 问题：输出纯描述文本（无序号前缀，便于模型直接读取）
+python3 vision_hook.py --files screenshot.png --question "用中文描述这张图片，提取所有文字"
+
+# 多图 / 批量：结果落盘后按需读取
+python3 vision_hook.py --files a.png b.png --out results.md
+```
+
+给目标环境（如 CLAUDE.md / 系统指令）的指令模板：
+
+```markdown
+## 图片识别
+
+如果模型不具备原生识图能力，遇到图片时不要用 Read 工具，改用：
+
+python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文描述这张图片，提取所有文字"
+
+对每张图片依次执行，拿到所有文字描述后再回复。这是强制规则。
+```
+
 ## 批量识别文件夹（数十张图）
+
+交互式贴图适合 1~5 张。**几十张图请用命令行批量模式**，结果写文件、不占对话上下文：
 
 交互式贴图适合 1~5 张。**几十张图请用命令行批量模式**，结果写文件、不占对话上下文：
 
