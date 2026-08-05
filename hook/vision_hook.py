@@ -282,7 +282,7 @@ def call_vision(cfg, data_uri, question, provider):
                 {"type": "image_url", "image_url": {"url": data_uri}},
             ],
         }],
-        "max_tokens": cfg.get("max_tokens", 1500),
+        "max_tokens": cfg.get("max_tokens", 4000),
         "stream": False,
     }
     headers = {
@@ -399,10 +399,12 @@ def main():
 
     # 4) 体积保护 + 数量上限
     kept = []
+    oversized = 0
     for mime, data_uri in resolved:
         est = len(data_uri) * 3 // 4  # data URI 长度 ≈ base64 长度 → 字节数估算
         if est > cfg.get("max_image_bytes", 10 * 1024 * 1024):
             log("image too large: ~%d bytes" % est)
+            oversized += 1
             continue
         kept.append((mime, data_uri))
     total_in = len(kept)
@@ -411,6 +413,14 @@ def main():
         log("batch truncated: %d -> %d" % (len(kept), max_images))
         kept = kept[:max_images]
     if not kept:
+        # 不静默丢图：明确告知用户有多少张因超限未识别及处理方式
+        if oversized:
+            limit = cfg.get("max_image_bytes", 10 * 1024 * 1024)
+            shown = ("%dMB" % (limit // (1024 * 1024))) if limit >= 1024 * 1024 else ("%dKB" % (limit // 1024))
+            msg = ("[Vision result] （%d 张图片超出大小限制（%s）未识别。"
+                   "可压缩图片，或调大 config 的 max_image_bytes 后重发）" % (oversized, shown))
+            print(json.dumps({"additionalContext": msg}, ensure_ascii=False))
+            log("all images oversized, informed user")
         return
 
     # 5) 路由：单图用默认 provider；超过阈值整批用 batch_provider
@@ -426,13 +436,14 @@ def main():
     log("routing: %d image(s), chain=%s" % (len(kept), chain))
 
     question = payload.get("prompt") or (target_texts[-1] if target_texts else None)
-    total_cap = cfg.get("total_max_chars", 4000)
+    total_cap = cfg.get("total_max_chars", 8000)
     # 预算均分：多图时每张分到 total_cap/张数 的注入空间（下限 200 字符），
     # 避免前几张图吃光预算、后面的图被整体截没。
-    per_cap = min(cfg.get("per_image_max_chars", 800),
+    per_cap = min(cfg.get("per_image_max_chars", 2000),
                   max(200, total_cap // max(len(kept), 1)))
 
-    parts = []
+    full_parts = []    # 每张图的完整识别文本（不截断，用于落盘/全量注入）
+    inject_parts = []  # 注入用的截断版
     used = set()
     multi = len(kept) > 1
     for i, (mime, data_uri) in enumerate(kept, 1):
@@ -442,17 +453,19 @@ def main():
             desc = call_vision(cfg, data_uri, q, prov)
             if desc:
                 used.add(prov)
+                full_parts.append(("图%d: " % i) + desc if multi else desc)
                 d = desc[:per_cap]
                 if len(desc) > per_cap:
                     d += "…(截断)"
-                parts.append(("图%d: " % i) + d if multi else d)
+                inject_parts.append(("图%d: " % i) + d if multi else d)
                 ok = True
                 break
         if not ok:
-            parts.append("图%d: (识别失败)" % i)
+            full_parts.append("图%d: (识别失败)" % i)
+            inject_parts.append("图%d: (识别失败)" % i)
             log("all providers failed for image %d" % i)
 
-    successes = [p for p in parts if not p.endswith("(识别失败)")]
+    successes = [p for p in inject_parts if not p.endswith("(识别失败)")]
     if not successes:
         log("no vision result at all")
         return
@@ -464,10 +477,31 @@ def main():
         save_state(state)
         log("state updated: %d attachment(s) marked" % len(identified))
 
-    result = "\n".join(parts)
+    # 完整优先注入：识别结果全程完整保留（full_text 不截断）。
+    # 未超 total_cap → 全量注入；超限 → 完整结果落盘 results/ 目录，
+    # 注入截断版并给出文件路径，需要全量时可读取——识别从不丢信息。
+    full_text = "\n".join(full_parts)
+    if oversized:
+        full_text += "\n（%d 张图片超出大小限制未识别）" % oversized
+    if len(full_text) <= total_cap:
+        result = full_text
+    else:
+        result = "\n".join(inject_parts)
+        result = result[:total_cap]
+        # 落盘提示追加在截断之后，保证可见（识别从不丢信息）
+        try:
+            res_dir = os.path.join(_HERE, "results")
+            os.makedirs(res_dir, exist_ok=True)
+            path = os.path.join(res_dir, "%s_%s.md" % (session_id or "session",
+                                                       time.strftime("%Y%m%d_%H%M%S")))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(full_text)
+            result += ("\n（识别已完成，但内容较长，完整结果已存至 %s，"
+                       "需要完整内容时可读取该文件）" % path)
+        except Exception as e:
+            log("save full result failed: %s" % e)
     if total_in > len(kept):
         result += "\n（共 %d 张图，已识别前 %d 张）" % (total_in, len(kept))
-    result = result[:total_cap]
     log("vision ok: %d image(s), %d chars, providers=%s" % (len(kept), len(result), ",".join(sorted(used))))
     print(json.dumps({"additionalContext": "[Vision result] " + result}, ensure_ascii=False))
 
@@ -586,7 +620,7 @@ def main_cli(argv):
     # 单文件且不落盘：输出纯描述文本（模型主动调用模式）
     plain = len(files) == 1 and not args.out
     text = run_folder_mode(cfg, files, question, args.out, chain,
-                           cfg.get("per_image_max_chars", 800), plain=plain)
+                           cfg.get("per_image_max_chars", 2000), plain=plain)
     if text is not None:
         print(text)
 

@@ -5,6 +5,9 @@ config.*.local.json
 # 运行状态(已识别附件记账,本地运行生成)
 vision_hook_state.json
 
+# 完整识别结果落盘
+results/
+
 # 运行日志
 *.log
 

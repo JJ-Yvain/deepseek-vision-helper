@@ -271,12 +271,12 @@ deepseek-vision-helper/
 | `fallback_provider` | `mimo` | 常规/批量失败后的降级后端 |
 | `batch_threshold` | 3 | 超过此张数视为批量 |
 | `max_images` | 4 | 单次最多识别张数（超出部分注入时注明） |
-| `per_image_max_chars` / `total_max_chars` | 800 / 4000 | 单张/总注入长度上限 |
-| `max_image_bytes` | 10485760 | 单张图片大小上限（超出跳过） |
+| `per_image_max_chars` / `total_max_chars` | 2000 / 8000 | 单张/总注入长度上限。默认已按"完整优先"设置；未超上限时识别结果**全量注入**，超限时完整结果自动落盘 `results/` 目录并在注入中给出文件路径（识别从不丢信息） |
+| `max_image_bytes` | 10485760 | 单张图片大小上限（超出跳过并明确告知，不静默） |
 | `timeout_seconds` | 90 | 单次 API 调用超时 |
 | `log_max_bytes` | 1048576 | 运行日志轮转阈值（超过后归档为 `vision_hook.log.1`，保留最近两段） |
 | `skip_when_multimodal` | false | 主模型是多模态（原生能看图）时设为 true：跳过视觉 API 识别与注入，图片走原生通道（也可用环境变量 `VISION_SKIP_MULTIMODAL=1`） |
-| `max_tokens` | 1500 | 识别结果 token 上限 |
+| `max_tokens` | 4000 | 识别结果 token 上限（越大识别越完整，响应越慢） |
 
 Provider 说明（OpenAI 兼容 `/chat/completions`，可自行添加任意提供商）：
 
