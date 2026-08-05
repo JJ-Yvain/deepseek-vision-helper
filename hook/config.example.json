@@ -28,7 +28,7 @@
       "auth_prefix": "Bearer "
     },
     "mimo": {
-      "base_url": "https://opencode.ai/zen/go/v1/chat/completions?ref=RKEAQV3NAW",
+      "base_url": "https://opencode.ai/zen/go/v1/chat/completions",
       "api_key": "YOUR_MIMO_API_KEY",
       "model": "mimo-v2.5",
       "header": "Authorization",

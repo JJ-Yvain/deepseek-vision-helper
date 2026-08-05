@@ -208,7 +208,7 @@ python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文�
 |---|---|---|
 | `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | **推荐**：免费聚合后端 |
 | `zhipu` | 免费 GLM-4.6V-Flash（bigmodel.cn） | 国内用户可注册；免费、快；有免费限流 |
-| `mimo` | 小米 MiMo-V2.5（经 opencode Go 网关） | 质量高但较慢；消耗套餐配额 |
+| `mimo` | 小米 MiMo-V2.5（经 opencode Go 网关） | 质量高但较慢；消耗套餐配额。👉 [通过推荐链接使用 opencode Go](https://opencode.ai/go?ref=RKEAQV3NAW) |
 | `mimo-direct` | 小米官方 API（api.xiaomimimo.com） | 备用；需 platform.xiaomimimo.com 的 key |
 
 OpenAI 兼容 `/chat/completions`，可自行添加任意提供商。`VISION_CONFIG=/path/config.json` 指定配置文件（测试用）。`mimo-v2.5` 支持图片，`mimo-v2.5-pro` 不支持。
