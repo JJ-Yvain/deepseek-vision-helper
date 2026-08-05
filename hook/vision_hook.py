@@ -264,6 +264,15 @@ def count_placeholder_images(texts):
     return n
 
 
+# 识别角色约束：把视觉后端钉死在"纯识别工具"上，
+# 只输出图片中的事实，禁止模型自己的分析/建议/总结/反问/常识补充。
+_SYSTEM_PROMPT = (
+    "你是一个图片识别工具。只输出图片中客观存在的内容：完整提取文字、"
+    "描述界面元素/图表数据/场景。严禁添加你的分析、总结、建议、评价、猜测或反问；"
+    "严禁输出图片之外的知识；如果图片中没有的信息，不要提及。"
+)
+
+
 def call_vision(cfg, data_uri, question, provider):
     """调用 OpenAI 兼容 /chat/completions，返回识别文本；失败返回 None。"""
     providers = cfg.get("providers", {})
@@ -273,15 +282,15 @@ def call_vision(cfg, data_uri, question, provider):
     p = providers[provider]
     payload = {
         "model": p["model"],
-        "messages": [{
-            "role": "user",
-            "content": [
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": [
                 {"type": "text", "text": question or cfg.get(
                     "default_question",
-                    "请识别这张图片：如果包含文字请完整提取；如果是界面、报错页面或图表，请说明其内容与含义。")},
+                    "请识别这张图片：如果包含文字请完整提取；如果是界面、报错页面或图表，请说明其内容与含义。只输出图片中的事实，不要分析、建议或反问。")},
                 {"type": "image_url", "image_url": {"url": data_uri}},
-            ],
-        }],
+            ]},
+        ],
         "max_tokens": cfg.get("max_tokens", 4000),
         "stream": False,
     }
