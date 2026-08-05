@@ -390,6 +390,13 @@ def main():
         log(guidance)
         return
 
+    # 多模态主模型场景（skip_when_multimodal=true 或 VISION_SKIP_MULTIMODAL=1）：
+    # 主模型能直接看到原图，跳过视觉 API 识别与注入，让图片走原生通道——
+    # 避免白耗 API 配额，也避免注入的低质量文本描述干扰模型直接看图。
+    if cfg.get("skip_when_multimodal") or os.environ.get("VISION_SKIP_MULTIMODAL") == "1":
+        log("skip: multimodal model configured, %d image(s) left to native channel" % len(resolved))
+        return
+
     # 4) 体积保护 + 数量上限
     kept = []
     for mime, data_uri in resolved:

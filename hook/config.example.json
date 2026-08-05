@@ -10,6 +10,7 @@
   "max_tokens": 1500,
   "timeout_seconds": 90,
   "log_max_bytes": 1048576,
+  "skip_when_multimodal": false,
   "default_question": "请识别这张图片：如果包含文字请完整提取；如果是界面、报错页面或图表，请说明其内容与含义。",
   "providers": {
     "zhipu": {

@@ -275,6 +275,7 @@ deepseek-vision-helper/
 | `max_image_bytes` | 10485760 | 单张图片大小上限（超出跳过） |
 | `timeout_seconds` | 90 | 单次 API 调用超时 |
 | `log_max_bytes` | 1048576 | 运行日志轮转阈值（超过后归档为 `vision_hook.log.1`，保留最近两段） |
+| `skip_when_multimodal` | false | 主模型是多模态（原生能看图）时设为 true：跳过视觉 API 识别与注入，图片走原生通道（也可用环境变量 `VISION_SKIP_MULTIMODAL=1`） |
 | `max_tokens` | 1500 | 识别结果 token 上限 |
 
 Provider 说明（OpenAI 兼容 `/chat/completions`，可自行添加任意提供商）：
