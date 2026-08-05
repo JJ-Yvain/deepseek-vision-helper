@@ -19,7 +19,7 @@ ZCode Vision Hook —— 给纯文本模型（DeepSeek 等）装上"眼睛"。
   5. 至少一张识别成功后，把本次识别的附件记入 state（下次不再重复注入）
 
 路由（config.json 可调）：
-  - 1 ~ batch_threshold 张  → provider（默认 zhipu / 免费 GLM-4.6V-Flash），失败降级 fallback_provider
+  - 1 ~ batch_threshold 张  → provider（默认 agnes / agnes-2.5-flash），失败降级 fallback_provider
   - 超过 batch_threshold 张 → batch_provider（默认 mimo / 小米 MiMo-V2.5），失败降级 fallback_provider
   - 环境变量 VISION_PROVIDER=xxx 可强制只用某 provider（调试用）
   - 环境变量 VISION_CONFIG=/path/to/config.json 可指定配置文件（测试用）
@@ -85,7 +85,7 @@ def config_guidance(cfg):
         return None
     return ("[vision helper] 未配置可用的 API key。两种配置方式："
             "① 设置环境变量 VISION_API_KEY_<PROVIDER>（如 VISION_API_KEY_ZHIPU）；"
-            "② 编辑 %s 的 providers 填入真实 key（免费推荐：bigmodel.cn 注册 GLM-4.6V-Flash）"
+            "② 编辑 %s 的 providers 填入真实 key（推荐 agnes：apihub.agnes-ai.com；国内用户可用智谱 bigmodel.cn 免费注册 GLM-4.6V-Flash）"
             % os.path.join(_HERE, "config.json"))
 
 
@@ -318,7 +318,7 @@ def build_chain(cfg):
     if forced:
         return [forced]
     threshold = cfg.get("batch_threshold", 3)
-    return [cfg.get("provider", "zhipu"), cfg.get("fallback_provider", "mimo")]
+    return [cfg.get("provider", "agnes"), cfg.get("fallback_provider", "mimo")]
 
 
 def main():
@@ -411,7 +411,7 @@ def main():
     if len(kept) > threshold:
         chain = [cfg.get("batch_provider", "mimo"), cfg.get("fallback_provider", "mimo")]
     else:
-        chain = [cfg.get("provider", "zhipu"), cfg.get("fallback_provider", "mimo")]
+        chain = [cfg.get("provider", "agnes"), cfg.get("fallback_provider", "mimo")]
     forced = os.environ.get("VISION_PROVIDER")
     if forced:
         chain = [forced]
@@ -546,7 +546,7 @@ def main_cli(argv):
     ap.add_argument("--folder", help="扫描并识别目录下所有图片（递归）")
     ap.add_argument("--files", nargs="*", help="指定图片文件列表")
     ap.add_argument("--out", help="结果写入文件（推荐；不写则打印到 stdout）")
-    ap.add_argument("--provider", help="强制使用某 provider（如 mimo/zhipu）")
+    ap.add_argument("--provider", help="强制使用某 provider（如 agnes/zhipu）")
     ap.add_argument("--max", type=int, default=0, help="最多识别张数（0=不限）")
     ap.add_argument("--question", default=None, help="识别问题（默认用 config 的 default_question）")
     args = ap.parse_args(argv)
@@ -572,7 +572,7 @@ def main_cli(argv):
     elif len(files) > threshold:
         chain = [cfg.get("batch_provider", "mimo"), cfg.get("fallback_provider", "mimo")]
     else:
-        chain = [cfg.get("provider", "zhipu"), cfg.get("fallback_provider", "mimo")]
+        chain = [cfg.get("provider", "agnes"), cfg.get("fallback_provider", "mimo")]
     chain = list(dict.fromkeys(p for p in chain if p))
     log("folder mode: %d file(s), chain=%s" % (len(files), chain))
     question = args.question or cfg.get("default_question")

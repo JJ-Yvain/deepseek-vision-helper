@@ -1,5 +1,5 @@
 {
-  "provider": "zhipu",
+  "provider": "agnes",
   "batch_provider": "mimo",
   "fallback_provider": "mimo",
   "batch_threshold": 3,

@@ -26,7 +26,8 @@
 3. **视觉 API key**（唯一需要用户参与的点）：
    - 先检查目标机器是否已有可复用的配置：`~/.zcode/vision-hook/config.json` 存在且
      `providers` 里有真实 key（非 `YOUR_` 开头）→ 复用，跳过步骤 2 的 key 配置。
-   - 否则**引导用户**提供 key：推荐智谱开放平台（bigmodel.cn）免费注册
+   - 否则**引导用户**提供 key：首选 **Agnes**（apihub.agnes-ai.com，agnes-2.5-flash，
+     免费聚合后端，推荐）；**国内用户**也可用智谱开放平台（bigmodel.cn）免费注册
      GLM-4.6V-Flash（免费额度），或小米 MiMo（platform.xiaomimimo.com）。
      告诉用户"安装过程中只需要这一步需要你提供 API key"，拿到 key 后继续。
    - 若用户拒绝提供 key，**停止安装**并解释：没有 key 视觉识别无法工作，skill 单独
@@ -62,15 +63,16 @@ cp hook/config.example.json ~/.zcode/vision-hook/config.json
 ```
 
 然后编辑 `~/.zcode/vision-hook/config.json`，把 `providers` 里你准备使用的 provider
-的 `api_key` 从 `YOUR_XXX_API_KEY` 替换为步骤 0 拿到的真实 key（至少填 `zhipu`，
-`mimo`/`agnes`/`mimo-direct` 可选；不用的 provider 可留占位符）。
-同时建议把 `provider` 字段设为已填 key 的那个（如 `"provider": "zhipu"`）。
+的 `api_key` 从 `YOUR_XXX_API_KEY` 替换为步骤 0 拿到的真实 key（**至少填 `agnes`**
+（推荐），`zhipu`（国内可用）`mimo`/`mimo-direct` 可选；不用的 provider 可留占位符）。
+同时建议把 `provider` 字段设为已填 key 的那个（如 `"provider": "agnes"`）。
 
 **也可以不改 config.json，改用环境变量**（优先级更高，适合不想在配置文件里写 key 的场景）：
 
 ```bash
-export VISION_API_KEY_ZHIPU=你的智谱key
-# 或 export VISION_API_KEY_MIMO=... / VISION_API_KEY_AGNES=...
+export VISION_API_KEY_AGNES=你的agnes key
+# 国内用户: export VISION_API_KEY_ZHIPU=你的智谱key
+# 或 export VISION_API_KEY_MIMO=... / VISION_API_KEY_MIMO_DIRECT=...
 ```
 
 环境变量命名规则：`VISION_API_KEY_<PROVIDER 大写、连字符转下划线>`（如
@@ -210,7 +212,7 @@ tail -3 ~/.zcode/vision-hook/vision_hook.log
 1. **装 skill**：把 `skills/deepseek-vision-helper/` 复制到 `~/.zcode/skills/`。
 2. **装 hook**：把 `hook/` 目录复制到 `~/.zcode/vision-hook/`，
    `config.example.json` 改名为 `config.json` 并填入你的 API key
-   （智谱 bigmodel.cn 免费注册 GLM-4.6V-Flash）。
+   （推荐 Agnes；国内用户可注册智谱 bigmodel.cn 免费 GLM-4.6V-Flash）。
 3. **注册 hooks**：在 `~/.zcode/cli/config.json` 的 `hooks` 字段加入
    `UserPromptSubmit` + `PreToolUse` 两个事件（JSON 模板见"步骤 3"），
    确保 `hooks.enabled: true`。
@@ -255,7 +257,7 @@ deepseek-vision-helper/
 
 | 场景 | 行为 |
 |---|---|
-| 1 ~ 3 张图（`batch_threshold`） | 用 `provider`（默认 zhipu / 免费 GLM-4.6V-Flash，约 8s/张） |
+| 1 ~ 3 张图（`batch_threshold`） | 用 `provider`（默认 agnes / agnes-2.5-flash，免费，约 8~20s/张） |
 | 单张失败（报错/超时/限流） | 自动降级 `fallback_provider` 重试该图 |
 | 超过阈值张数 | 整批改用 `batch_provider`（质量高、避开免费限流） |
 | 手动强制 | 环境变量 `VISION_PROVIDER=mimo` 强制只用某 provider |
@@ -264,7 +266,7 @@ deepseek-vision-helper/
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `provider` | `zhipu` | 常规后端 |
+| `provider` | `agnes` | 常规后端 |
 | `batch_provider` | `mimo` | 批量后端（超过阈值时） |
 | `fallback_provider` | `mimo` | 常规/批量失败后的降级后端 |
 | `batch_threshold` | 3 | 超过此张数视为批量 |
@@ -279,8 +281,8 @@ Provider 说明（OpenAI 兼容 `/chat/completions`，可自行添加任意提�
 
 | provider | 后端 | 说明 |
 |---|---|---|
-| `zhipu` | 免费 GLM-4.6V-Flash（bigmodel.cn） | 免费、快；有免费限流 |
-| `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | 免费聚合后端 |
+| `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | **推荐**：免费聚合后端 |
+| `zhipu` | 免费 GLM-4.6V-Flash（bigmodel.cn） | 国内用户可注册；免费、快；有免费限流 |
 | `mimo` | 小米 MiMo-V2.5（经 opencode Go 网关） | 质量高但较慢；消耗套餐配额 |
 | `mimo-direct` | 小米官方 API（api.xiaomimimo.com） | 备用；需 platform.xiaomimimo.com 的 key |
 
