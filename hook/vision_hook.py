@@ -586,7 +586,10 @@ def main():
 
     log("vision ok: %d image(s) processed, %d done, %d remaining, providers=%s" % (
         processed, done, remaining, ",".join(sorted(used))))
-    print(json.dumps({"additionalContext": "[Vision result] " + result}, ensure_ascii=False))
+    # 注入带时间戳轮次标识：对话中多次贴图时，主模型可凭 [Vision result @HH:MM:SS]
+    # 区分各轮识别结果，以最新时间戳为准。
+    print(json.dumps({"additionalContext": "[Vision result @%s] " % time.strftime("%H:%M:%S") + result},
+                     ensure_ascii=False))
 
 
 def collect_files(folder, files):
