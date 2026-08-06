@@ -176,6 +176,7 @@ python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文�
 - **双事件**：UserPromptSubmit + PreToolUse 任一触发都会尝试取图；state 记账保证同一批图只注入一次；无图时静默跳过（实测约 93ms）
 - **取图 = state 增量附件监控**：ZCode 的 hook transcript 只含纯文本（UserPromptSubmit 仅 prompt、PreToolUse 为空），图片 part 不会出现在 transcript 里——粘贴的图片附件落盘到 `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt`，脚本对比 `vision_hook_state.json` 只识别新落盘的附件，这是唯一可靠通道
 - **注入**：stdout 输出 `{"additionalContext": "[Vision result] ..."}`；失败静默（exit 0）不影响对话
+- **纯事实识别**：请求带 system prompt 将视觉后端约束为"图片识别工具"——只输出图片中客观存在的内容（文字提取、界面/图表/场景描述），**不包含**模型自己的分析、建议、总结、猜测或反问；一切判断由主模型完成
 
 ### 自动路由
 
