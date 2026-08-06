@@ -601,6 +601,12 @@ def file_to_data_uri(path, mime):
     import base64
     with open(path, "rb") as f:
         raw = f.read()
+    try:
+        text = raw.decode("utf-8").strip()
+        if text.startswith("data:"):
+            return text  # 文件内容已是 data URI（如 artifacts 附件），直接使用，避免双重编码
+    except Exception:
+        pass
     return "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
 
 
