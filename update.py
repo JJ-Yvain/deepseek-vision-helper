@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 
 REPO_URL = "https://github.com/JJ-Yvain/deepseek-vision-helper"
@@ -95,6 +96,29 @@ def download_fallback(hook_dir, skill_dir):
     return updated
 
 
+def backup_old(hook_dir, keep=3):
+    """更新前把旧脚本与版本标记备份到 hook_dir/backup/<时间戳>/，保留最近 keep 份。"""
+    root = os.path.join(hook_dir, "backup")
+    try:
+        os.makedirs(root, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        d = os.path.join(root, stamp)
+        os.makedirs(d, exist_ok=True)
+        for f in ("vision_hook.py", "VERSION"):
+            src = os.path.join(hook_dir, f)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(d, f))
+        # 清理旧备份
+        dirs = sorted(x for x in os.listdir(root)
+                      if os.path.isdir(os.path.join(root, x)))
+        while len(dirs) > keep:
+            shutil.rmtree(os.path.join(root, dirs.pop(0)))
+        return d
+    except Exception as e:
+        print("备份失败(继续更新): %s" % e)
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="DeepSeek Vision Helper 更新执行器")
     ap.add_argument("--hook-dir", default=os.path.expanduser("~/.zcode/vision-hook"),
@@ -112,6 +136,9 @@ def main():
         return
 
     print("检测到新版本: %s -> %s" % (cur or "未安装版本标记", latest))
+    bak = backup_old(args.hook_dir)
+    if bak:
+        print("旧版本已备份: %s" % bak)
     repo = git_clone()
     if repo:
         print("使用 git 全量同步...")

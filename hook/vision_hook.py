@@ -560,11 +560,15 @@ def main():
     if not inject_parts:
         # 有图但一张都没处理（理论极小概率）或全部失败：告知用户，不静默
         result += ("\n（本次 %d 张图片均未能识别：请检查 API key / 网络，"
-                   "或稍后回复“重试”）" % total_in)
+                   "下次触发将自动重试）" % total_in)
         log("no vision result at all")
     elif remaining > 0:
-        result += ("\n（识别进度：已识别 %d/%d 张，还有 %d 张未识别；"
-                   "回复“继续”即可续传）" % (done, total_in, remaining))
+        result += ("\n（识别进度：已识别 %d/%d 张，还有 %d 张将自动继续识别）" % (
+            done, total_in, remaining))
+    elif inject_parts and all(p.endswith("(识别失败)") for p in inject_parts):
+        # 全部失败：明确告知，下次触发自动重试
+        result += ("\n（本次 %d 张图片均未能识别：请检查 API key / 网络，"
+                   "下次触发将自动重试）" % total_in)
     elif big:
         result += "\n（%d 张图片超过大小限制，已尽力识别）" % big
 
@@ -573,7 +577,7 @@ def main():
         latest = check_update(cfg, state)
         if latest and state.get("last_notified_version") != latest:
             state["last_notified_version"] = latest
-            result += "\n⚠️ 检测到新版本 %s（当前 %s），回复“更新”即可自动更新" % (
+            result += "\n（已检测到新版本 %s（当前 %s），将自动更新）" % (
                 latest, local_version())
             log("update available: %s -> %s" % (local_version(), latest))
             save_state(state)
