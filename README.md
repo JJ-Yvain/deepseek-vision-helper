@@ -61,12 +61,12 @@ export VISION_API_KEY_AGNES=你的key
   "UserPromptSubmit": [
     { "matcher": ".*", "hooks": [
       { "type": "process", "command": "/usr/bin/python3",
-        "args": ["/home/<用户名>/.zcode/vision-hook/vision_hook.py"], "timeoutMs": 300000 } ] }
+        "args": ["/home/<用户名>/.zcode/vision-hook/vision_hook.py"], "timeoutMs": 960000 } ] }
   ],
   "PreToolUse": [
     { "matcher": ".*", "hooks": [
       { "type": "process", "command": "/usr/bin/python3",
-        "args": ["/home/<用户名>/.zcode/vision-hook/vision_hook.py"], "timeoutMs": 300000 } ] }
+        "args": ["/home/<用户名>/.zcode/vision-hook/vision_hook.py"], "timeoutMs": 960000 } ] }
   ]
 }
 ```
@@ -124,7 +124,7 @@ EOF
 
 粘贴图片发送即可。**全部识别原则**：用户给多少图就识别多少图——不截断、不丢弃、不因大小跳过。超大图仍尽力识别，个别失败会明确标注原因（可压缩后重发）。
 
-**大量图片（超出单轮时间预算）**：每轮在 `recognition_time_budget`（默认 240 秒）内串行识别，预算用完时注入**进度报告**：
+**大量图片**：每轮在 `recognition_time_budget`（默认 900 秒）内串行识别全部图片——发 20 张图一次识别完（约 8~13 分钟），仅在极端数量（超预算）时才注入**进度报告**续传：
 
 > （识别进度：已识别 5/12 张，还有 7 张将自动继续识别）
 
@@ -235,7 +235,7 @@ cp -r /tmp/dvh/skills/deepseek-vision-helper/* ~/.zcode/skills/deepseek-vision-h
 |---|---|---|
 | `provider` / `batch_provider` / `fallback_provider` | agnes / mimo / mimo | 常规 / 批量 / 降级后端 |
 | `batch_threshold` | 3 | 超过此张数视为批量 |
-| `recognition_time_budget` | 240 | 每轮识别时间预算（秒）；预算内识别全部图片，超出则注入进度并续传 |
+| `recognition_time_budget` | 900 | 单轮识别时间预算（秒）；预算内一次识别全部图片，超出（极端数量）则进度续传 |
 | `per_image_max_chars` / `total_max_chars` | 2000 / 8000 | 注入长度上限（识别不受限；超限落盘见"使用"） |
 | `max_image_bytes` | 10485760 | 大小提示阈值（超过仍尽力识别，不跳过） |
 | `timeout_seconds` | 90 | 单次 API 超时 |
