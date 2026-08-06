@@ -39,6 +39,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _LOG = os.path.join(_HERE, "vision_hook.log")
 _STATE_FILE = os.path.join(_HERE, "vision_hook_state.json")
 _LOG_MAX_BYTES = 1024 * 1024  # 日志轮转阈值(默认 1MB,可由 config.log_max_bytes 覆盖)
+_UPDATE_URL = os.environ.get(
+    "VISION_UPDATE_URL",
+    "https://raw.githubusercontent.com/JJ-Yvain/deepseek-vision-helper/main/VERSION")
 
 
 def _rotate_log():
@@ -243,6 +246,46 @@ def mark_identified(state, session_id, attachments):
     for fn, mt, _ in attachments:
         known[fn] = mt
     state[session_id] = known
+
+
+# ---------- 版本自检（agent-reach 模式：检查自动、更新需确认） ----------
+# 仅在"识别成功注入"时顺带检查（有图场景用户在场），频率受
+# update_check_interval_hours 控制（默认 24h）；有新版时在注入末尾附一行提示，
+# 同版本不重复提醒；网络失败静默。更新由用户一句话触发（update.py）。
+
+
+def local_version():
+    """读取本地 VERSION 文件（数据目录优先，其次脚本目录）；缺失返回 None。"""
+    for base in (os.environ.get("ZCODE_PLUGIN_DATA") or "", _HERE):
+        p = os.path.join(base, "VERSION")
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    v = f.read().strip()
+                return v or None
+            except Exception:
+                return None
+    return None
+
+
+def check_update(cfg, state):
+    """对比远程 VERSION；返回远程新版本号；无需检查/无更新/失败返回 None。"""
+    cur = local_version()
+    if not cur:
+        return None  # 本地无版本标记 → 跳过（不打扰）
+    interval = float(cfg.get("update_check_interval_hours", 24))
+    last = state.get("last_update_check", 0)
+    if time.time() - last < interval * 3600:
+        return None  # 频率控制：interval 小时内只查一次
+    state["last_update_check"] = time.time()  # 先记账：失败也不在 interval 内重试
+    try:
+        req = urllib.request.Request(_UPDATE_URL,
+                                     headers={"User-Agent": "zcode-vision-hook/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            latest = resp.read().decode("utf-8").strip()
+    except Exception:
+        return None  # 网络失败静默
+    return latest if (latest and latest != cur) else None
 
 
 _PLACEHOLDER_RE = None  # 延迟初始化（避免 import 顺序问题）
@@ -511,6 +554,19 @@ def main():
             log("save full result failed: %s" % e)
     if total_in > len(kept):
         result += "\n（共 %d 张图，已识别前 %d 张）" % (total_in, len(kept))
+
+    # 版本自检：有新版 → 注入末尾附提示（同版本不重复提醒；失败/无本地版本静默）
+    try:
+        latest = check_update(cfg, state)
+        if latest and state.get("last_notified_version") != latest:
+            state["last_notified_version"] = latest
+            result += "\n⚠️ 检测到新版本 %s（当前 %s），回复“更新”即可自动更新" % (
+                latest, local_version())
+            log("update available: %s -> %s" % (local_version(), latest))
+            save_state(state)
+    except Exception:
+        pass
+
     log("vision ok: %d image(s), %d chars, providers=%s" % (len(kept), len(result), ",".join(sorted(used))))
     print(json.dumps({"additionalContext": "[Vision result] " + result}, ensure_ascii=False))
 

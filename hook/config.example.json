@@ -41,5 +41,6 @@
       "header": "Authorization",
       "auth_prefix": "Bearer "
     }
-  }
+  },
+  "update_check_interval_hours": 24
 }

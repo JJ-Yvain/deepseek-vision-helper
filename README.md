@@ -38,6 +38,7 @@ cp -r skills/deepseek-vision-helper ~/.zcode/skills/
 mkdir -p ~/.zcode/vision-hook
 cp hook/vision_hook.py ~/.zcode/vision-hook/
 cp hook/config.example.json ~/.zcode/vision-hook/config.json
+cp VERSION ~/.zcode/vision-hook/   # 版本标记（自动更新对比用，缺失则跳过自检，不影响功能）
 ```
 
 编辑 `config.json`：至少一个 provider 的 `api_key` 从 `YOUR_*` 换成真实 key，并把 `provider` 设为该 provider。
@@ -151,7 +152,39 @@ python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文�
 
 ---
 
-## 4. 故障排查
+## 4. 自动更新
+
+**机制**（检查自动、更新需确认）：识别成功时顺带检查 GitHub 上的最新版本（默认每 24 小时一次，可配 `update_check_interval_hours`）。有新版时，识别结果末尾会附一行：
+
+> ⚠️ 检测到新版本 vX.Y.Z（当前 vX.Y.Z），回复"更新"即可自动更新
+
+- 同版本不重复提醒；本地无 `VERSION` 文件或网络失败时静默跳过，不影响使用
+
+**更新方式**（任选）：
+
+```bash
+# 方式一：更新执行器（推荐）——自动对比版本、同步文件、保留用户数据
+curl -L -o /tmp/vision-update.py https://raw.githubusercontent.com/JJ-Yvain/deepseek-vision-helper/main/update.py
+python /tmp/vision-update.py
+# 指定安装目录时:
+python /tmp/vision-update.py --hook-dir ~/.zcode/vision-hook --skill-dir ~/.zcode/skills/deepseek-vision-helper
+```
+
+```bash
+# 方式二：手动（git）
+git clone --depth 1 https://github.com/JJ-Yvain/deepseek-vision-helper /tmp/dvh
+cp /tmp/dvh/hook/vision_hook.py ~/.zcode/vision-hook/
+cp /tmp/dvh/VERSION ~/.zcode/vision-hook/
+cp -r /tmp/dvh/skills/deepseek-vision-helper/* ~/.zcode/skills/deepseek-vision-helper/
+```
+
+更新器**始终保留**用户数据（`config.json` / `vision_hook_state.json` / `*.log` / `results/`），不会覆盖你的 key 配置。更新完成后重启 ZCode 客户端生效。
+
+> **维护者注意（版本纪律）**：每次内容变更必须 bump 仓库根目录的 `VERSION` 文件（同时更新本地安装目录的副本），否则自检无法感知新版本。
+
+---
+
+## 5. 故障排查
 
 | 症状 | 定位与修复 |
 |---|---|
@@ -165,7 +198,7 @@ python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文�
 
 ---
 
-## 5. 设计与配置参考
+## 6. 设计与配置参考
 
 ### 工作原理
 
@@ -202,6 +235,7 @@ python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文�
 | `max_tokens` | 4000 | 识别输出 token 上限 |
 | `log_max_bytes` | 1048576 | 日志轮转阈值（归档为 `.log.1`，保留最近两段） |
 | `skip_when_multimodal` | false | 主模型原生多模态时设 true：跳过识别注入，图片走原生通道（或 `VISION_SKIP_MULTIMODAL=1`） |
+| `update_check_interval_hours` | 24 | 版本自检间隔（小时）；0 = 禁用自检 |
 
 ### Provider
 
