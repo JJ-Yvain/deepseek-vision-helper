@@ -450,59 +450,34 @@ def main():
         log("no image found")
         return
 
-    # 体积保护 + 数量上限（先于记账：被截断丢弃的图不记账，保留重试语义）
-    kept = []
-    oversized = 0
-    for mime, data_uri in resolved:
-        est = len(data_uri) * 3 // 4  # data URI 长度 ≈ base64 长度 → 字节数估算
-        if est > cfg.get("max_image_bytes", 10 * 1024 * 1024):
-            log("image too large: ~%d bytes" % est)
-            oversized += 1
-            continue
-        kept.append((mime, data_uri))
-    total_in = len(kept)
-    max_images = cfg.get("max_images", 4)
-    if len(kept) > max_images:
-        log("batch truncated: %d -> %d" % (len(kept), max_images))
-        kept = kept[:max_images]
-        # 被丢弃的图标记为"已跳过"：不混入下次注入（不记 known），
-        # 用户重发该图（新文件名）仍可识别。
-        if len(identified) > max_images:
-            mark_skipped(state, session_id, identified[max_images:])
-        identified = identified[:max_images]
-
-    # 记账：进入识别流程的附件标记为"已处理"（filename -> mtime），与识别结果解耦。
-    # 关键：无论之后发生什么（未配置 key / skip 多模态 / 识别失败 / 成功），已取到的附件
-    # 都必须记账——否则它们会被当作"新附件"混入下一次注入（旧图污染新图）。
-    # 用户重发某张图会产生新附件文件，仍可正常识别。
-    if identified:
-        mark_identified(state, session_id, identified)
-        save_state(state)
-        log("state updated: %d attachment(s) marked" % len(identified))
-
-    # 未配置可用 key：日志给出明确引导（hook 保持静默退出，不注入）
+    # 记账与前置检查：本轮不会真正识别时（未配置 key / skip 多模态），
+    # 已取到的附件全部记账（防混入）；识别路径则逐张记账（成功即记）。
     guidance = config_guidance(cfg)
     if guidance:
+        if identified:
+            mark_identified(state, session_id, identified)
+            save_state(state)
         log(guidance)
         return
 
-    # 多模态主模型场景（skip_when_multimodal=true 或 VISION_SKIP_MULTIMODAL=1）：
-    # 主模型能直接看到原图，跳过视觉 API 识别与注入，让图片走原生通道——
-    # 避免白耗 API 配额，也避免注入的低质量文本描述干扰模型直接看图。
     if cfg.get("skip_when_multimodal") or os.environ.get("VISION_SKIP_MULTIMODAL") == "1":
-        log("skip: multimodal model configured, %d image(s) left to native channel" % len(kept))
+        if identified:
+            mark_identified(state, session_id, identified)
+            save_state(state)
+        log("skip: multimodal model configured, %d image(s) left to native channel" % len(resolved))
         return
 
-    if not kept:
-        # 不静默丢图：明确告知用户有多少张因超限未识别及处理方式
-        if oversized:
-            limit = cfg.get("max_image_bytes", 10 * 1024 * 1024)
-            shown = ("%dMB" % (limit // (1024 * 1024))) if limit >= 1024 * 1024 else ("%dKB" % (limit // 1024))
-            msg = ("[Vision result] （%d 张图片超出大小限制（%s）未识别。"
-                   "可压缩图片，或调大 config 的 max_image_bytes 后重发）" % (oversized, shown))
-            print(json.dumps({"additionalContext": msg}, ensure_ascii=False))
-            log("all images oversized, informed user")
-        return
+    # 识别队列：不过滤、不截断、不因大小跳过——用户给多少识别多少；
+    # 超大图仍尽力发送，失败时在结果中明确标注原因（可压缩后重发）。
+    kept = list(resolved)
+    big = sum(1 for mime, data_uri in resolved
+              if len(data_uri) * 3 // 4 > cfg.get("max_image_bytes", 10 * 1024 * 1024))
+    total_in = len(kept)
+
+    # 时间预算：每轮 hook 在此预算内串行识别；预算用完停止，未识别的图
+    # 不记账，由用户回复"继续"触发下一轮续传（已识别的逐张记账，绝不重复）。
+    budget = float(cfg.get("recognition_time_budget", 240))
+    deadline = time.time() + budget
 
     # 5) 路由：单图用默认 provider；超过阈值整批用 batch_provider
     threshold = cfg.get("batch_threshold", 3)
@@ -527,7 +502,11 @@ def main():
     inject_parts = []  # 注入用的截断版
     used = set()
     multi = len(kept) > 1
+    processed = 0      # 已尝试处理的张数（含失败）
+    done = 0           # 识别成功的张数
     for i, (mime, data_uri) in enumerate(kept, 1):
+        if time.time() > deadline:
+            break  # 时间预算用完：剩余图不记账，下次"继续"续传
         q = ("图%d。%s" % (i, question)) if multi else question
         ok = False
         for prov in chain:
@@ -540,29 +519,32 @@ def main():
                     d += "…(截断)"
                 inject_parts.append(("图%d: " % i) + d if multi else d)
                 ok = True
+                done += 1
                 break
-        if not ok:
+        processed = i
+        if ok:
+            # 逐张记账：识别成功立即标记，续传不会重复识别
+            if identified and i - 1 < len(identified):
+                mark_identified(state, session_id, [identified[i - 1]])
+                save_state(state)
+        else:
             full_parts.append("图%d: (识别失败)" % i)
             inject_parts.append("图%d: (识别失败)" % i)
             log("all providers failed for image %d" % i)
 
-    successes = [p for p in inject_parts if not p.endswith("(识别失败)")]
-    if not successes:
-        log("no vision result at all")
-        return
+    remaining = total_in - processed
 
     # 完整优先注入：识别结果全程完整保留（full_text 不截断）。
     # 未超 total_cap → 全量注入；超限 → 完整结果落盘 results/ 目录，
     # 注入截断版并给出文件路径，需要全量时可读取——识别从不丢信息。
     full_text = "\n".join(full_parts)
-    if oversized:
-        full_text += "\n（%d 张图片超出大小限制未识别）" % oversized
+    if big:
+        full_text += "\n（%d 张图片超过大小限制，已尽力识别；个别失败请压缩后重发）" % big
     if len(full_text) <= total_cap:
         result = full_text
     else:
         result = "\n".join(inject_parts)
         result = result[:total_cap]
-        # 落盘提示追加在截断之后，保证可见（识别从不丢信息）
         try:
             res_dir = os.path.join(_HERE, "results")
             os.makedirs(res_dir, exist_ok=True)
@@ -574,10 +556,17 @@ def main():
                        "需要完整内容时可读取该文件）" % path)
         except Exception as e:
             log("save full result failed: %s" % e)
-    if total_in > len(kept):
-        result += ("\n（本轮共 %d 张图，单次上限 %d 张，已识别前 %d 张；"
-                   "其余未识别，可重发或调大 config 的 max_images）" % (
-                       total_in, max_images, len(kept)))
+
+    if not inject_parts:
+        # 有图但一张都没处理（理论极小概率）或全部失败：告知用户，不静默
+        result += ("\n（本次 %d 张图片均未能识别：请检查 API key / 网络，"
+                   "或稍后回复“重试”）" % total_in)
+        log("no vision result at all")
+    elif remaining > 0:
+        result += ("\n（识别进度：已识别 %d/%d 张，还有 %d 张未识别；"
+                   "回复“继续”即可续传）" % (done, total_in, remaining))
+    elif big:
+        result += "\n（%d 张图片超过大小限制，已尽力识别）" % big
 
     # 版本自检：有新版 → 注入末尾附提示（同版本不重复提醒；失败/无本地版本静默）
     try:
@@ -591,7 +580,8 @@ def main():
     except Exception:
         pass
 
-    log("vision ok: %d image(s), %d chars, providers=%s" % (len(kept), len(result), ",".join(sorted(used))))
+    log("vision ok: %d image(s) processed, %d done, %d remaining, providers=%s" % (
+        processed, done, remaining, ",".join(sorted(used))))
     print(json.dumps({"additionalContext": "[Vision result] " + result}, ensure_ascii=False))
 
 

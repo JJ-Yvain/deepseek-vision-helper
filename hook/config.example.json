@@ -42,5 +42,6 @@
       "auth_prefix": "Bearer "
     }
   },
-  "update_check_interval_hours": 24
+  "update_check_interval_hours": 24,
+  "recognition_time_budget": 240
 }
