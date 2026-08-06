@@ -545,13 +545,22 @@ def main():
     else:
         result = "\n".join(inject_parts)
         result = result[:total_cap]
+        # 完整结果落盘:同一会话复用同一文件(后续轮次追加,路径恒定),
+        # 避免续传多轮生成一堆文件、模型/用户不知道读哪个。
         try:
             res_dir = os.path.join(_HERE, "results")
             os.makedirs(res_dir, exist_ok=True)
-            path = os.path.join(res_dir, "%s_%s.md" % (session_id or "session",
-                                                       time.strftime("%Y%m%d_%H%M%S")))
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(full_text)
+            path = state.get("_results_path", {}).get(session_id or "")
+            if not path or not os.path.exists(path):
+                path = os.path.join(res_dir, "%s_%s.md" % (session_id or "session",
+                                                           time.strftime("%Y%m%d_%H%M%S")))
+                state.setdefault("_results_path", {})[session_id or ""] = path
+                save_state(state)
+                mode = "w"
+            else:
+                mode = "a"
+            with open(path, mode, encoding="utf-8") as f:
+                f.write(("\n\n" if mode == "a" else "") + full_text)
             result += ("\n（识别已完成，但内容较长，完整结果已存至 %s，"
                        "需要完整内容时可读取该文件）" % path)
         except Exception as e:

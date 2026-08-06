@@ -43,5 +43,5 @@
     }
   },
   "update_check_interval_hours": 24,
-  "recognition_time_budget": 240
+  "recognition_time_budget": 900
 }
