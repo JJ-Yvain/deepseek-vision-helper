@@ -436,6 +436,15 @@ def main():
         log("no image found")
         return
 
+    # 记账：附件一旦被取到就立即标记为"已处理"（filename -> mtime），与后续结果解耦。
+    # 关键：无论之后发生什么（未配置 key / skip 多模态 / 识别失败 / 成功），已取到的附件
+    # 都必须记账——否则它们会被当作"新附件"混入下一次注入（旧图污染新图）。
+    # 用户重发某张图会产生新附件文件，仍可正常识别。
+    if identified:
+        mark_identified(state, session_id, identified)
+        save_state(state)
+        log("state updated: %d attachment(s) marked" % len(identified))
+
     # 未配置可用 key：日志给出明确引导（hook 保持静默退出，不注入）
     guidance = config_guidance(cfg)
     if guidance:
@@ -521,13 +530,6 @@ def main():
     if not successes:
         log("no vision result at all")
         return
-
-    # 至少一张识别成功才记账：本次识别的附件标记为"已识别"，后续事件（如
-    # UserPromptSubmit + PreToolUse 双触发）不会重复注入同一批图。
-    if identified:
-        mark_identified(state, session_id, identified)
-        save_state(state)
-        log("state updated: %d attachment(s) marked" % len(identified))
 
     # 完整优先注入：识别结果全程完整保留（full_text 不截断）。
     # 未超 total_cap → 全量注入；超限 → 完整结果落盘 results/ 目录，
