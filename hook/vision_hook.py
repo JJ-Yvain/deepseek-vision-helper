@@ -395,6 +395,8 @@ def main():
         payload = json.loads(raw)
     except Exception:
         return
+    if not isinstance(payload, dict):
+        return  # 畸形 payload(数组/字符串等)静默退出,不崩溃
     session_id = payload.get("session_id", "")
     log("hook fired: event=%s session=%s" % (payload.get("hook_event_name"), session_id))
 
