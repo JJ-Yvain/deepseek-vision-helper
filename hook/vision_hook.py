@@ -491,7 +491,13 @@ def main():
     chain = list(dict.fromkeys(p for p in chain if p))
     log("routing: %d image(s), chain=%s" % (len(kept), chain))
 
-    question = payload.get("prompt") or (target_texts[-1] if target_texts else None)
+    # 纯识别指令：不把用户问题传给视觉模型（用户问题中的"如何解决/建议"类
+    # 引导会诱发视觉模型输出建议，违背"只交接信息"原则）——视觉请求只用
+    # 固定识别指令，建议通道物理关闭；一切判断由主模型基于注入的事实完成。
+    recog_q = cfg.get(
+        "default_question",
+        "请识别这张图片：如果包含文字请完整提取；如果是界面、报错页面或图表，"
+        "请说明其内容与含义。只输出图片中的事实，不要分析、建议或反问。")
     total_cap = cfg.get("total_max_chars", 8000)
     # 预算均分：多图时每张分到 total_cap/张数 的注入空间（下限 200 字符），
     # 避免前几张图吃光预算、后面的图被整体截没。
@@ -507,7 +513,7 @@ def main():
     for i, (mime, data_uri) in enumerate(kept, 1):
         if time.time() > deadline:
             break  # 时间预算用完：剩余图不记账，下次"继续"续传
-        q = ("图%d。%s" % (i, question)) if multi else question
+        q = ("图%d。%s" % (i, recog_q)) if multi else recog_q
         ok = False
         for prov in chain:
             desc = call_vision(cfg, data_uri, q, prov)
