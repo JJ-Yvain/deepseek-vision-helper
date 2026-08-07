@@ -254,6 +254,50 @@ def mark_skipped(state, session_id, attachments):
         skipped[fn] = mt
 
 
+def cleanup_old(state, cfg):
+    """低频清理，防止 state 记账与 results 落盘无限增长。
+
+    - results/ 中超过 results_max_age_days（默认 7 天）的文件删除
+    - state 中：会话目录已不存在的整会话记录删除；附件 mtime 超过
+      state_max_age_days（默认 30 天）的单条记录删除（防重复语义早已无意义）
+    - 每 state_cleanup_interval_hours（默认 24 小时）执行一次（state 记 last_cleanup）
+    """
+    interval = float(cfg.get("state_cleanup_interval_hours", 24))
+    now = time.time()
+    if now - float(state.get("last_cleanup", 0)) < interval * 3600:
+        return
+    state["last_cleanup"] = now
+
+    # 1) results 旧文件清理
+    res_dir = os.path.join(_HERE, "results")
+    max_days = float(cfg.get("results_max_age_days", 7))
+    if os.path.isdir(res_dir):
+        for fn in os.listdir(res_dir):
+            p = os.path.join(res_dir, fn)
+            try:
+                if now - os.path.getmtime(p) > max_days * 86400:
+                    os.remove(p)
+            except OSError:
+                pass
+
+    # 2) state 过期记录清理
+    state_days = float(cfg.get("state_max_age_days", 30))
+    base = os.path.expanduser(cfg.get("artifacts_dir", "~/.zcode/cli/artifacts"))
+    for sess, recs in list(state.items()):
+        if sess in ("_skipped", "_results_path", "last_update_check",
+                    "last_notified_version", "last_cleanup"):
+            continue
+        if not isinstance(recs, dict):
+            continue
+        if not os.path.isdir(os.path.join(base, sess)):
+            del state[sess]  # 会话目录已不存在 → 整会话记录删除
+            continue
+        stale = [fn for fn, mt in recs.items()
+                 if isinstance(mt, (int, float)) and now - mt > state_days * 86400]
+        for fn in stale:
+            del recs[fn]
+
+
 def mark_identified(state, session_id, attachments):
     """把已成功识别的附件记入 state（filename -> mtime）。"""
     known = state.get(session_id, {})
@@ -404,6 +448,7 @@ def main():
     global _LOG_MAX_BYTES
     _LOG_MAX_BYTES = cfg.get("log_max_bytes", 1024 * 1024)
     state = load_state()
+    cleanup_old(state, cfg)  # 低频清理:过期 state 记录 + 旧 results 文件
     msgs = parse_transcript(payload.get("transcript_path"))
     log("transcript=%s msgs=%d" % (payload.get("transcript_path"), len(msgs)))
 

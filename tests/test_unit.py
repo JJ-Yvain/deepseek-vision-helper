@@ -135,6 +135,37 @@ def run_unit():
     # ---------- 9. 占位符计数 ----------
     rec("9. 占位符计数", vh.count_placeholder_images(["[Attached image/png: a.png] x [Attached image: b]"]) == 2)
 
+    # ---------- 10. cleanup_old: 防无限增长 ----------
+    res = os.path.join(tmp, "results")
+    os.makedirs(res)
+    old_f = os.path.join(res, "old.md")
+    open(old_f, "w").write("x")
+    os.utime(old_f, (time.time() - 10 * 86400, time.time() - 10 * 86400))
+    new_f = os.path.join(res, "new.md")
+    open(new_f, "w").write("x")
+    os.makedirs(os.path.join(tmp, "sess_alive"))
+    st_cl = {
+        "sess_dead": {"prompt-attachment-upload-a.txt": 100.0},
+        "sess_alive": {
+            "prompt-attachment-upload-old.txt": time.time() - 40 * 86400,
+            "prompt-attachment-upload-new.txt": time.time(),
+        },
+    }
+    cfg_cl = {"artifacts_dir": tmp, "results_max_age_days": 7,
+              "state_max_age_days": 30, "state_cleanup_interval_hours": 24}
+    vh._HERE = tmp
+    vh.cleanup_old(st_cl, cfg_cl)
+    rec("10a. cleanup: results 旧文件清理(保留新)",
+        not os.path.exists(old_f) and os.path.exists(new_f))
+    rec("10b. cleanup: 死会话清理", "sess_dead" not in st_cl)
+    rec("10c. cleanup: 过期记录清理(保留新)",
+        "prompt-attachment-upload-old.txt" not in st_cl["sess_alive"]
+        and "prompt-attachment-upload-new.txt" in st_cl["sess_alive"])
+    st_cl2 = {"last_cleanup": time.time()}
+    vh.cleanup_old(st_cl2, cfg_cl)
+    rec("10d. cleanup: 24h 频率控制", st_cl2.get("last_cleanup") is not None)
+    vh._HERE = os.path.dirname(HOOK)
+
     if old_env:
         os.environ["VISION_CONFIG"] = old_env
     else:

@@ -252,6 +252,9 @@ python run_all.py --slow    # 慢速档：真实视觉 API 回归 + DeepSeek 交
 | `provider` / `batch_provider` / `fallback_provider` | agnes / mimo / mimo | 常规 / 批量 / 降级后端 |
 | `batch_threshold` | 3 | 超过此张数视为批量 |
 | `recognition_time_budget` | 900 | 单轮识别时间预算（秒）；预算内一次识别全部图片，超出（极端数量）则进度续传 |
+| `results_max_age_days` | 7 | 完整识别落盘（results/）保留天数，过期自动清理 |
+| `state_max_age_days` | 30 | state 记账保留天数（防重复语义过期即清），防无限增长 |
+| `state_cleanup_interval_hours` | 24 | 自动清理执行间隔（小时） |
 | `per_image_max_chars` / `total_max_chars` | 2000 / 8000 | 注入长度上限（识别不受限；超限落盘见"使用"） |
 | `max_image_bytes` | 10485760 | 大小提示阈值（超过仍尽力识别，不跳过） |
 | `timeout_seconds` | 90 | 单次 API 超时 |
