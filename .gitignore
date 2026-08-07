@@ -14,3 +14,8 @@ results/
 # Python
 __pycache__/
 *.pyc
+
+# 测试运行时产物
+tests/_cfg.json
+tests/_empty.jsonl
+tests/last_result.json

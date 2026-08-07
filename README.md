@@ -191,7 +191,23 @@ cp -r /tmp/dvh/skills/deepseek-vision-helper/* ~/.zcode/skills/deepseek-vision-h
 
 ---
 
-## 5. 故障排查
+## 5. 测试（验证体系随仓库分发）
+
+本仓库自带完整的科学验证体系（`tests/`），任何人 clone 后可一键验证：
+
+```bash
+cd tests
+python run_all.py --fast    # 快速档：单元/性质/契约/模糊/故障注入/攻击集（秒级，无需 API key）
+python run_all.py --slow    # 慢速档：真实视觉 API 回归 + DeepSeek 交接质量实测（需配置好 key）
+```
+
+分层：L0 单元/性质 → L1 契约/模糊 → L2 故障注入（mock API）→ 攻击集 → 真实集成 → DeepSeek 交接 eval。
+迭代机制：每次发现 bug 固化为用例（红→修→绿→永久保留），结果版本化写入 `last_result.json`。
+详见 `tests/README.md`。
+
+---
+
+## 6. 故障排查
 
 | 症状 | 定位与修复 |
 |---|---|
@@ -205,7 +221,7 @@ cp -r /tmp/dvh/skills/deepseek-vision-helper/* ~/.zcode/skills/deepseek-vision-h
 
 ---
 
-## 6. 设计与配置参考
+## 7. 设计与配置参考
 
 ### 工作原理
 
