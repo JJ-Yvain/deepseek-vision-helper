@@ -20,7 +20,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 FAST = ["test_unit.py", "test_contract.py", "test_fuzz.py",
-        "test_fault_injection.py", "test_adversarial.py"]
+        "test_fault_injection.py", "test_adversarial.py", "test_stale_attachment.py",
+        "test_mcp_server.py"]
 SLOW = ["test_regression.py", "test_multi_round.py", "test_handoff.py"]
 
 

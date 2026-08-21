@@ -8,12 +8,14 @@ ZCode Vision Hook —— 给纯文本模型（DeepSeek 等）装上"眼睛"。
   1. 从 stdin 读取 ZCode 注入的 JSON（session_id / transcript_path / prompt / tool_name ...）
   2. 取图（按优先级）：
      a. transcript 里的图片 part（file / Anthropic 内联 base64 / zcode-artifact:// URI）
-     b. transcript 用户文本里的 [Attached image...] 占位符 → artifacts 兜底
-     c. 【核心】state 增量监控：扫描 ~/.zcode/cli/artifacts/<会话>/ 下新落盘的
-        prompt-attachment-upload-*.txt（与 vision_hook_state.json 中已识别记录对比，
-        只识别新文件，天然去重）——ZCode 的 hook transcript 只含纯文本（UserPromptSubmit
-        仅 prompt、PreToolUse 为空），图片 part 永远不会出现在 transcript 里，
-        因此附件增量监控是贴图识别的唯一可靠通道。
+     b. 【核心】提交级附件识别：UserPromptSubmit 时查会话 DB
+        （~/.zcode/cli/db/db.sqlite）input_history.attachments——这是 ZCode
+        本次实际提交的附件（zcode-artifact:// URI），写入时机早于 hook 触发约 1s。
+        只识别提交记录里的附件；"贴了又删"的附件（磁盘文件残留、无提交记录）
+        不再被误识别（2026-08-11 修复：旧实现扫描全部未记账文件导致旧图混入）。
+     c. 权威信号缺失（DB 不可用）→ 降级"新鲜度门控"扫描：只识别 fresh_seconds
+        内新落盘的 prompt-attachment-upload-*.txt，防陈年残留误识别。
+     d. 续传通道：预算截断的附件（state._skipped）在后续事件（"继续"/PreToolUse）补识别。
   3. 按路由规则选择视觉后端，逐张识别（见"路由"）
   4. stdout 输出 {"additionalContext": "[Vision result] ..."} 注入对话上下文
   5. 至少一张识别成功后，把本次识别的附件记入 state（下次不再重复注入）
@@ -230,9 +232,8 @@ def list_attachments(session_id, cfg):
 def new_attachments(session_id, cfg, state, max_n):
     """返回 state 未记录（或 mtime 已变化）的附件 [(fn, mtime, path)]，按新旧倒序，最多 max_n。
 
-    附件在用户粘贴图片时即落盘，与提交时机无关：只要它在上一次 hook 运行之后
-    出现（state 未记录），本次就会被识别——"发图必识别、已识别不重复"。
-    被"已跳过"标记的附件（曾因单次上限被截断）不再自动取，用户重发即新文件。
+    仅用于"权威信号缺失"时的降级扫描（配合 fresh_seconds 门控）；
+    被 _skipped 标记的附件（预算截断）不在此列，走 skipped_attachments 续传。
     """
     files = list_attachments(session_id, cfg)
     known = state.get(session_id, {}) if isinstance(state, dict) else {}
@@ -299,11 +300,131 @@ def cleanup_old(state, cfg):
 
 
 def mark_identified(state, session_id, attachments):
-    """把已成功识别的附件记入 state（filename -> mtime）。"""
+    """把已成功识别的附件记入 state（filename -> mtime），并移出跳过表。"""
     known = state.get(session_id, {})
+    skipped = state.get("_skipped", {}).get(session_id, {})
     for fn, mt, _ in attachments:
         known[fn] = mt
+        if skipped.get(fn) == mt:
+            del skipped[fn]
     state[session_id] = known
+
+
+# ---------- 提交级附件识别（权威信号） ----------
+# 平台事实（ZCode 3.7.x 源码级验证）：
+#   1) 附件在粘贴时即物化写盘（writePromptAttachment → artifacts/<会话>/
+#      prompt-attachment-upload-*.txt），文件名每次粘贴唯一；UI 移除附件
+#      （removeAttachment）只撤销 objectURL + 取消传输，没有任何删文件 RPC
+#      → "贴了又删"的附件文件永久残留磁盘；
+#   2) hook 的 UserPromptSubmit transcript 只含 prompt 纯文本（CLI 端
+#      F2n("user", e.prompt) 构造），不含任何附件信号；
+#   3) 唯一权威信号：~/.zcode/cli/db/db.sqlite 的 input_history.attachments，
+#      记录本次实际提交的附件（zcode-artifact:// URI 或本地路径），实测写入
+#      时机早于 UserPromptSubmit hook 触发约 1s。
+# 因此：以 input_history 为"本次提交了什么"的唯一依据；只识别提交记录里的附件，
+# 磁盘上残留但从未提交的文件（删图/换图）不再被误识别。
+
+
+def db_path_from_cfg(cfg):
+    """会话 DB 路径：优先 config.session_db_path，否则由 artifacts_dir 推导。
+
+    artifacts_dir 默认 ~/.zcode/cli/artifacts → 推导 ~/.zcode/cli/db/db.sqlite。
+    """
+    p = cfg.get("session_db_path")
+    if p:
+        return os.path.expanduser(p)
+    art = os.path.expanduser(cfg.get("artifacts_dir", "~/.zcode/cli/artifacts"))
+    return os.path.join(os.path.dirname(art), "db", "db.sqlite")
+
+
+def submitted_attachments(session_id, cfg):
+    """从会话 DB 的 input_history 读取最近一次用户提交的附件（权威信号）。
+
+    返回 [(path, content, mime)]（仅图片附件）；以下情形返回 None（无法判定）：
+      - DB 文件不存在 / 打开失败 / 查询失败
+      - 该会话没有 input_history 行
+    返回 [] 表示"有行但本次提交无附件"（权威：本次无需识别任何附件）。
+    """
+    import sqlite3
+    db = db_path_from_cfg(cfg)
+    if not os.path.isfile(db):
+        log("session db not found: %s" % db)
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2)
+        cur = con.cursor()
+        row = cur.execute(
+            "SELECT attachments FROM input_history WHERE session_id=? AND kind='prompt' "
+            "ORDER BY time_created DESC, id DESC LIMIT 1", (session_id,)).fetchone()
+        con.close()
+    except Exception as e:
+        log("session db query failed: %s" % e)
+        return None
+    if row is None:
+        log("no input_history row for session")
+        return None
+    att = (row[0] or "").strip()
+    if not att:
+        return []  # 权威：本次提交无附件
+    try:
+        arr = json.loads(att)
+    except Exception:
+        log("input_history attachments parse failed")
+        return None
+    out = []
+    for a in arr if isinstance(arr, list) else []:
+        if not isinstance(a, dict):
+            continue
+        # ZCode 的附件 JSON 无 mime 字段(实测), 图片用 type=="image" 判定
+        mime = a.get("mime") or a.get("mimeType") or ""
+        if str(a.get("type") or "").lower() == "image" or str(mime).startswith("image/"):
+            out.append((str(a.get("path") or ""), str(a.get("content") or ""),
+                        str(mime) or "image/png"))
+    return out
+
+
+def resolve_submitted_attachment(session_id, cfg, path, content, mime):
+    """把 input_history 附件精确解析为 (mime, data_uri, (fn, mtime, abspath))。
+
+    只做精确匹配（artifactId 在文件名中 / 本地文件直读），不做"最新附件"兜底
+    ——兜底正是旧图误识别的来源之一；无法解析返回 None。
+    """
+    if content.startswith("zcode-artifact://"):
+        rest = content[len("zcode-artifact://"):]
+        parts = rest.split("/", 1)
+        name = parts[1] if len(parts) > 1 else ""
+        if name:
+            base = os.path.expanduser(cfg.get("artifacts_dir", "~/.zcode/cli/artifacts"))
+            d = os.path.join(base, session_id)
+            if os.path.isdir(d):
+                for fn in os.listdir(d):
+                    if (fn.startswith("prompt-attachment-upload") and fn.endswith(".txt")
+                            and name in fn):
+                        p = os.path.join(d, fn)
+                        try:
+                            mt = os.path.getmtime(p)
+                        except OSError:
+                            continue
+                        return mime, read_uri_file(p, mime), (fn, mt, p)
+            log("submitted attachment artifact not found: %s" % content)
+        return None
+    if path and os.path.isfile(path):  # 本地文件附件直读
+        return mime, file_to_data_uri(path, mime), (os.path.basename(path),
+                                                    os.path.getmtime(path), path)
+    return None
+
+
+def skipped_attachments(session_id, cfg, state):
+    """返回 state._skipped 中仍存在于磁盘的附件 [(fn, mtime, abspath)]（按新旧倒序）。
+
+    续传通道：预算截断的附件在此标记，由"继续"或后续事件补识别。
+    """
+    files = list_attachments(session_id, cfg)
+    skipped = (state.get("_skipped", {}).get(session_id, {})
+               if isinstance(state, dict) else {})
+    out = [(fn, mt, p) for fn, mt, p in files if skipped.get(fn) == mt]
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
 
 
 # ---------- 版本自检（agent-reach 模式：检查自动、更新需确认） ----------
@@ -454,14 +575,10 @@ def main():
 
     # 1) 收集本消息内的全部图片
     img_infos = []
-    target_texts = []
     if msgs and msgs[-1].get("images"):
         img_infos = msgs[-1]["images"]
-        target_texts = msgs[-1]["texts"]
-    if msgs and not img_infos:
-        target_texts = msgs[-1]["texts"]  # 无图时也记录文本，供占位符检测
 
-    # 2) 逐张解析成 data URI（单张解析失败不影响其他张）
+    # 2) 逐张解析成 data URI（单张解析失败不影响其他张；其他客户端的 transcript 内联图）
     resolved = []
     for info in img_infos:
         r = resolve_image(info, session_id, cfg)
@@ -470,29 +587,53 @@ def main():
         else:
             log("image resolve failed for one part")
 
-    # 3) 占位符兜底：transcript 用户文本里出现 [Attached image...] 标记时，按数量取图。
-    #    （ZCode 的 hook transcript 只含纯文本，此路径通常不命中；保留以防其他客户端行为差异）
+    # 3) 【核心】提交级附件识别（权威信号 = 会话 DB input_history.attachments）
+    #    ZCode 的 transcript 拿不到图（UserPromptSubmit 仅纯文本 prompt、
+    #    PreToolUse 为空）；input_history 记录本次实际提交的附件 URI——
+    #    输入框里"贴了又删"的附件不会出现在任何提交记录里，因此不再被误识别
+    #    （旧实现扫描全部未记账文件，是"旧图混入"bug 的根因）。
+    #    - UserPromptSubmit：权威信号 → 精确识别本次提交的图；
+    #      信号缺失（DB 不可用）→ 降级"新鲜度门控"扫描（防陈年残留）。
+    #    - PreToolUse：无提交上下文，只做续传，不扫描新附件（防"贴了还没发"
+    #      的图被提前识别——旧图混入的另一条路径）。
     identified = []  # 本次识别成功的附件（供 state 记账去重）
-    if not resolved:
-        n_ph = count_placeholder_images(target_texts)
-        if n_ph:
-            log("placeholder detected: %d image marker(s)" % n_ph)
-            max_n = min(n_ph, cfg.get("max_images", 4))
-            atts = new_attachments(session_id, cfg, state, 50)
+    event = payload.get("hook_event_name", "")
+    if event == "UserPromptSubmit" and not resolved:
+        subs = submitted_attachments(session_id, cfg)
+        if subs is None:
+            log("authoritative signal unavailable, fallback to fresh scan")
+            fresh = float(cfg.get("fresh_seconds", 300))
+            now = time.time()
+            atts = [(fn, mt, p) for fn, mt, p in new_attachments(session_id, cfg, state, 50)
+                    if now - mt < fresh]
             if atts:
-                log("placeholder resolved %d attachment(s)" % len(atts))
+                log("fallback fresh attachment(s) detected: %d" % len(atts))
                 resolved = [("image/png", read_uri_file(p, "image/png")) for _, _, p in atts]
                 identified = atts
+        elif subs == []:
+            log("no attachments in this submit")
+        else:
+            known = state.get(session_id, {}) if isinstance(state, dict) else {}
+            for path, content, mime in subs:
+                r = resolve_submitted_attachment(session_id, cfg, path, content, mime)
+                if not r:
+                    log("submitted attachment unresolvable")
+                    continue
+                _mime, _uri, rec = r
+                if known.get(rec[0]) == rec[1]:
+                    continue  # 已识别过(同图重发/编辑重提), 不重复注入
+                resolved.append((_mime, _uri))
+                identified.append(rec)
+            if identified:
+                log("submitted attachment(s) resolved: %d" % len(identified))
 
-    # 4) 【核心】state 增量附件监控：transcript 拿不到图（UserPromptSubmit 仅纯文本
-    #    prompt、PreToolUse 为空 transcript），改从 artifacts 目录识别"新落盘"的附件，
-    #    与已识别记录对比，可靠且天然去重——"发图必识别"。
+    # 4) 续传通道：预算截断的附件（已标记 _skipped）在后续事件补识别
     if not resolved:
-        atts = new_attachments(session_id, cfg, state, 50)
-        if atts:
-            log("new attachment(s) detected: %d (state-based)" % len(atts))
-            resolved = [("image/png", read_uri_file(p, "image/png")) for _, _, p in atts]
-            identified = atts
+        cont = skipped_attachments(session_id, cfg, state)
+        if cont:
+            log("continuation: %d skipped attachment(s)" % len(cont))
+            resolved = [("image/png", read_uri_file(p, "image/png")) for _, _, p in cont]
+            identified = cont
     if not resolved:
         log("no image found")
         return
@@ -586,6 +727,12 @@ def main():
             log("all providers failed for image %d" % i)
 
     remaining = total_in - processed
+
+    # 预算截断：未处理的附件标记 _skipped（不混入未提交文件），
+    # 供"继续"/后续 PreToolUse 续传补识别。
+    if remaining > 0 and identified and processed < len(identified):
+        mark_skipped(state, session_id, identified[processed:])
+        save_state(state)
 
     # 完整优先注入：识别结果全程完整保留（full_text 不截断）。
     # 未超 total_cap → 全量注入；超限 → 完整结果落盘 results/ 目录，

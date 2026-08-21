@@ -1,299 +1,145 @@
-# DeepSeek Vision Helper
+# ZCode Vision Hook —— 给纯文本模型装上"眼睛"
 
-给纯文本模型（DeepSeek 等）装上"眼睛"：粘贴图片 → 自动识别 → 以 `[Vision result]` 注入对话上下文，模型即可直接回答图片问题。
+粘贴/拖入图片提交消息时，自动调用视觉模型（默认 agnes-2.5-flash）识别，
+把结果以 `[Vision result] ...` 注入对话上下文，纯文本模型（DeepSeek 等）即可直接回答图片相关问题。
 
-> **读者指南**
-> - **AI 代理**，想自主安装 → 读第 1 节
-> - **人类用户**，想手动安装 → 读第 2 节
-> - **了解原理 / 调参 / 排查** → 读第 3~5 节
+## 原理
 
----
-
-## 1. AI 自主安装指南
-
-按顺序执行；第 0 步不满足时**停止并告知用户原因**。
-
-### 第 0 步：环境检查
-
-1. **必须是 ZCode**（或兼容客户端）——依赖其 hooks 事件与 `~/.zcode/cli/artifacts/` 附件目录。非 ZCode 环境只能装 skill（第 1 步），hook 无法工作，如实告知。
-2. **Python 3 可用**：`python3 --version`，记录解释器绝对路径（后续命令用它）。
-3. **视觉 API key**（唯一需要用户参与的点）：
-   - 已有可复用配置（`~/.zcode/vision-hook/config.json` 含非 `YOUR_*` 的 key）→ 复用，跳过第 2 步的 key 配置
-   - 否则引导用户提供：**首选 Agnes**（apihub.agnes-ai.com，免费）；国内用户可用智谱 bigmodel.cn 免费 GLM-4.6V-Flash
-   - 用户拒绝 → 停止安装（无 key 无法识别）
-
-### 第 1 步：安装 skill
-
-```bash
-mkdir -p ~/.zcode/skills
-cp -r skills/deepseek-vision-helper ~/.zcode/skills/
+```
+粘贴图片 + 提问 → UserPromptSubmit Hook → 从会话 DB input_history 取本次提交的附件 → 调视觉 API → 结果注入上下文 → 文本模型回答
 ```
 
-- 跨工具共享（Claude/Codex 兼容）：装到 `~/.agents/skills/deepseek-vision-helper/`
-- **完成标准**：`SKILL.md` 存在，frontmatter `name: deepseek-vision-helper`
+- Hook 事件：`UserPromptSubmit`（每次用户提交消息时触发，无图时静默跳过，开销约 0.2 秒）
+- 取图（权威信号）：`~/.zcode/cli/db/db.sqlite` 的 `input_history.attachments` 记录本次
+  实际提交的附件（`zcode-artifact://` URI，写入时机早于 hook 触发约 1s）→ 精确识别。
+  **输入框里"贴了又删"的附件（磁盘文件残留、无提交记录）不再被误识别**（2026-08-11 修复）。
+- 兜底：会话 DB 不可用（路径缺失/查询失败）时降级"新鲜度门控"扫描——只识别
+  `fresh_seconds`（默认 300s）内新落盘的附件，防陈年残留误识别。
+- 续传：预算截断的附件标记 `_skipped`，由"继续"或后续 PreToolUse 补识别。
+- `PreToolUse` 不再扫描新附件（防"贴在输入框还没发"的图被提前识别）；只做续传。
+- 注入：stdout 输出 `{"additionalContext": "[Vision result] ..."}`
+- 失败静默：无图 / 接口报错 → 空输出（exit 0），不影响对话
 
-### 第 2 步：安装 hook + 配置 key
+## 文件
 
-```bash
-mkdir -p ~/.zcode/vision-hook
-cp hook/vision_hook.py ~/.zcode/vision-hook/
-cp hook/config.example.json ~/.zcode/vision-hook/config.json
-cp VERSION ~/.zcode/vision-hook/   # 版本标记（自动更新对比用，缺失则跳过自检，不影响功能）
-```
+| 文件 | 作用 |
+|---|---|
+| `vision_hook.py` | Hook 脚本 + CLI 批量模式（Python 3，仅标准库） |
+| `vision_mcp.py` | MCP server：把识别能力注册为工具，主/子 Agent 任务中遇图可主动调用（薄壳，复用 vision_hook.py CLI） |
+| `config.json` | 提供商配置 + API key（**密钥，勿提交仓库**） |
+| `vision_hook.log` / `vision_mcp.log` | 运行日志（调试用，不含 key） |
 
-编辑 `config.json`：至少一个 provider 的 `api_key` 从 `YOUR_*` 换成真实 key，并把 `provider` 设为该 provider。
+## MCP 主动调用通道（任务中遇图）
 
-**或用环境变量**（优先级更高，不改配置文件）：
+用户贴图由 hook 自动识别（被动）；**任务中遇到图片文件**（主 Agent / 子 Agent 分析截图、图表、报错界面等）时，模型通过 MCP 工具主动识别：
 
-```bash
-export VISION_API_KEY_AGNES=你的key
-# 命名规则:VISION_API_KEY_<PROVIDER 大写、连字符转下划线>,如 VISION_API_KEY_MIMO_DIRECT
-```
-
-**完成标准**：`python3 -m json.tool config.json` 通过；至少一个 key 非 `YOUR_*`，或已设环境变量。
-
-### 第 3 步：注册 hooks
-
-编辑 `~/.zcode/cli/config.json`，在 `hooks` 下**合并**（不覆盖已有条目）两个事件：
+- 工具：`vision_recognize(path, question?)`（单图）、`vision_batch(folder, out?)`（批量落盘）
+- 注册：`~/.zcode/cli/config.json` 的 `mcp.servers`（见下），改后重启 ZCode 或 `/mcp connect vision` 生效
+- **薄壳设计**：MCP 内部 subprocess 调 `vision_hook.py --files/--folder`，识别逻辑/路由/降级/配置全复用——优化 hook/CLI 自动继承，MCP 不会失效或脱节
+- 使用引导在 SKILL.md「主动识别通道」章节
 
 ```json
 {
-  "UserPromptSubmit": [
-    { "matcher": ".*", "hooks": [
-      { "type": "process", "command": "/usr/bin/python3",
-        "args": ["/home/<用户名>/.zcode/vision-hook/vision_hook.py"], "timeoutMs": 960000 } ] }
-  ],
-  "PreToolUse": [
-    { "matcher": ".*", "hooks": [
-      { "type": "process", "command": "/usr/bin/python3",
-        "args": ["/home/<用户名>/.zcode/vision-hook/vision_hook.py"], "timeoutMs": 960000 } ] }
-  ]
+  "mcp": {
+    "servers": [
+      {
+        "name": "vision",
+        "command": "<python 解释器绝对路径>",
+        "args": ["<vision_mcp.py 绝对路径>"],
+        "protocolVersion": "auto"
+      }
+    ]
+  }
 }
 ```
 
-- `command` 用第 0 步的 Python **绝对路径**；`args` 用 vision_hook.py **绝对路径**（不留 `~`）
-- Windows PowerShell 用 `Copy-Item` 等对应命令，路径分隔符 `/` 或 `\` 均可
-- 确保 `hooks.enabled: true`
-
-**完成标准**：JSON 合法；两个事件存在。
-
-### 第 4 步：初始化识别状态
-
-防止首次运行把历史附件当新图误识别（无历史附件时输出 0 属正常）：
-
-```bash
-python3 - <<'EOF'
-import json, os
-base = os.path.expanduser("~/.zcode/cli/artifacts")
-state, n = {}, 0
-for sess in os.listdir(base):
-    d = os.path.join(base, sess)
-    if not os.path.isdir(d): continue
-    for fn in os.listdir(d):
-        if fn.startswith("prompt-attachment-upload") and fn.endswith(".txt"):
-            state.setdefault(sess, {})[fn] = os.path.getmtime(os.path.join(d, fn)); n += 1
-if n:
-    json.dump(state, open(os.path.expanduser("~/.zcode/vision-hook/vision_hook_state.json"), "w", encoding="utf-8"), ensure_ascii=False)
-print("initialized %d attachment(s)" % n)
-EOF
-```
-
-### 第 5 步：自检
-
-| 检查 | 命令 | 预期 |
-|---|---|---|
-| 无图静默 | `echo '{"hook_event_name":"UserPromptSubmit","session_id":"x","transcript_path":"/tmp/none","prompt":"hi"}' \| python3 ~/.zcode/vision-hook/vision_hook.py; echo $?` | 无输出、exit 0 |
-| 日志触发 | `tail -3 ~/.zcode/vision-hook/vision_hook.log` | 含 `hook fired` |
-| 贴图注入 | ZCode 里粘贴图片发送 | 上下文出现 `[Vision result]` |
-
-> 事件配置在会话启动时加载，改配置后需**重启 ZCode 客户端**再测第 3 项。
-
----
-
-## 2. 人类安装简版
-
-1. `skills/deepseek-vision-helper/` → `~/.zcode/skills/`；`hook/` 目录 → `~/.zcode/vision-hook/`，`config.example.json` 改名 `config.json` 填 key（推荐 Agnes；国内可注册智谱）
-2. 注册 hooks（JSON 模板见 1.3），`hooks.enabled: true`
-3. 重启客户端，贴图测试
-
----
-
-## 3. 使用
-
-### 贴图即用
-
-粘贴图片发送即可。**全部识别原则**：用户给多少图就识别多少图——不截断、不丢弃、不因大小跳过。超大图仍尽力识别，个别失败会明确标注原因（可压缩后重发）。
-
-**大量图片**：每轮在 `recognition_time_budget`（默认 900 秒）内串行识别全部图片——发 20 张图一次识别完（约 8~13 分钟），仅在极端数量（超预算）时才注入**进度报告**续传：
-
-> （识别进度：已识别 5/12 张，还有 7 张将自动继续识别）
-
-**无需用户操作**：用户下一条消息（任何内容）即自动触发续传（已识别的逐张记账，绝不重复），直到全部识别完成。识别结果**完整优先**：未超注入上限时全量注入；超限时完整结果自动落盘 `results/` 目录并在注入中给出文件路径（识别从不丢信息）。
-
-### 批量识别（几十张图）
-
-```bash
-python3 vision_hook.py --folder "图片目录" --out results.md   # 递归扫描
-python3 vision_hook.py --files a.png b.png --out results.md   # 指定文件
-```
-
-结果写文件、不占对话上下文；支持 png/jpg/jpeg/webp/gif/bmp。
-
-### 模型主动调用（无 hook 环境）
-
-单图输出纯文本描述，任何 Agent 可当普通命令调用：
-
-```bash
-python3 vision_hook.py --files 图.png --question "用中文描述这张图片"
-```
-
-给目标环境的指令模板：
-
-```markdown
-## 图片识别
-模型不具备识图能力时,遇到图片不要用 Read,改用:
-python3 /path/to/vision_hook.py --files "<图片路径>" --question "用中文描述这张图片"
-对每张图片依次执行,拿到全部文字描述后再回复。这是强制规则。
-```
-
----
-
-## 4. 自动更新
-
-**机制**（检查自动、更新需确认）：识别成功时顺带检查 GitHub 上的最新版本（默认每 24 小时一次，可配 `update_check_interval_hours`）。有新版时，识别结果末尾会附一行：
-
-> （已检测到新版本 vX.Y.Z（当前 vX.Y.Z），将自动更新）
-
-- 同版本不重复提醒；本地无 `VERSION` 文件或网络失败时静默跳过，不影响使用
-- **AI 自主更新**：检测到新版本时由 AI 自动执行更新（更新器保留用户数据、更新前自动备份），无需用户确认
-
-**更新方式**（任选）：
-
-```bash
-# 方式一：更新执行器（推荐）——自动对比版本、同步文件、保留用户数据
-curl -L -o /tmp/vision-update.py https://raw.githubusercontent.com/JJ-Yvain/deepseek-vision-helper/main/update.py
-python /tmp/vision-update.py
-# 指定安装目录时:
-python /tmp/vision-update.py --hook-dir ~/.zcode/vision-hook --skill-dir ~/.zcode/skills/deepseek-vision-helper
-```
-
-```bash
-# 方式二：手动（git）
-git clone --depth 1 https://github.com/JJ-Yvain/deepseek-vision-helper /tmp/dvh
-cp /tmp/dvh/hook/vision_hook.py ~/.zcode/vision-hook/
-cp /tmp/dvh/VERSION ~/.zcode/vision-hook/
-cp -r /tmp/dvh/skills/deepseek-vision-helper/* ~/.zcode/skills/deepseek-vision-helper/
-```
-
-更新器**始终保留**用户数据（`config.json` / `vision_hook_state.json` / `*.log` / `results/`），不会覆盖你的 key 配置。更新完成后重启 ZCode 客户端生效。
-
-> **维护者注意（版本纪律）**：每次内容变更必须 bump 仓库根目录的 `VERSION` 文件（同时更新本地安装目录的副本），否则自检无法感知新版本。
-
----
-
-## 5. 测试（验证体系随仓库分发）
-
-本仓库自带完整的科学验证体系（`tests/`），任何人 clone 后可一键验证：
-
-```bash
-cd tests
-python run_all.py --fast    # 快速档：单元/性质/契约/模糊/故障注入/攻击集（秒级，无需 API key）
-python run_all.py --slow    # 慢速档：真实视觉 API 回归 + DeepSeek 交接质量实测（需配置好 key）
-```
-
-分层：L0 单元/性质 → L1 契约/模糊 → L2 故障注入（mock API）→ 攻击集 → 真实集成 → DeepSeek 交接 eval。
-迭代机制：每次发现 bug 固化为用例（红→修→绿→永久保留），结果版本化写入 `last_result.json`。
-详见 `tests/README.md`。
-
----
-
-## 6. 故障排查
-
-| 症状 | 定位与修复 |
-|---|---|
-| 日志无 `hook fired` | hook 未注册：检查 `hooks.enabled: true`、事件名大小写、matcher；改配置后是否重启 |
-| 日志有 `未配置可用的 API key` | 所有 key 都是 `YOUR_*` 或为空：填 key 或设 `VISION_API_KEY_<PROVIDER>` 环境变量 |
-| `no image found` | 无新落盘附件：确认贴图后 `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt` 存在；若文件在但未识别，检查 `vision_hook_state.json` 已记账（同图只识别一次，正常） |
-| `vision api failed (HTTP xxx)` | 401 = key 无效；1305/429/5xx = 平台过载，自动重试；网络问题检查代理 |
-| `provider missing in config` | `provider`/`batch_provider`/`fallback_provider` 指向了未填 key 的 provider |
-| skill 不触发 | `SKILL.md` 的 description 必须含 `[Vision result]`；skill 位于发现根目录 |
-| 注入出现"完整结果已存至" | 识别完整但超注入上限：读取提示中的文件获取全量，无需重发 |
-
----
-
-## 7. 设计与配置参考
-
-### 工作原理
-
-```
-粘贴图片 + 提问 → UserPromptSubmit / PreToolUse Hook → 检测新落盘附件 → 调视觉 API → 结果注入上下文 → 文本模型回答
-```
-
-- **双事件**：UserPromptSubmit + PreToolUse 任一触发都会尝试取图；state 记账保证同一批图只注入一次；无图时静默跳过（实测约 93ms）
-- **取图 = state 增量附件监控**：ZCode 的 hook transcript 只含纯文本（UserPromptSubmit 仅 prompt、PreToolUse 为空），图片 part 不会出现在 transcript 里——粘贴的图片附件落盘到 `~/.zcode/cli/artifacts/<会话>/prompt-attachment-upload-*.txt`，脚本对比 `vision_hook_state.json` 只识别新落盘的附件，这是唯一可靠通道
-- **注入**：stdout 输出 `{"additionalContext": "[Vision result] ..."}`；失败静默（exit 0）不影响对话
-- **纯事实识别**：请求带 system prompt 将视觉后端约束为"图片识别工具"——只输出图片中客观存在的内容（文字提取、界面/图表/场景描述），**不包含**模型自己的分析、建议、总结、猜测或反问；一切判断由主模型完成
-
-### 自动路由
+## 自动路由（默认：agnes 免费打底，mimo 兜底/批量）
 
 | 场景 | 行为 |
 |---|---|
-| 1 ~ `batch_threshold` 张 | `provider`（默认 agnes，免费，约 8~20s/张） |
-| 单张失败 | 自动降级 `fallback_provider` 重试 |
-| 超过阈值 | 整批改用 `batch_provider`（质量高、避开免费限流） |
-| 手动强制 | `VISION_PROVIDER=mimo` 环境变量 |
+| 1 ~ 3 张图（`batch_threshold`） | 用 `provider`（默认 agnes / agnes-2.5-flash，免费） |
+| 单张默认后端失败（报错/超时/限流） | 自动降级 `fallback_provider`（默认 mimo）重试该图 |
+| 超过 3 张图 | 整批改用 `batch_provider`（默认 mimo，质量高、避开免费后端限流） |
+| 手动强制 | 环境变量 `VISION_PROVIDER=mimo` 强制只用某 provider |
 
-批量串行执行，最坏耗时 ≈ 张数 × 单张耗时。
-
-### 配置项
+配置项（`config.json`，改动即时生效）：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `provider` / `batch_provider` / `fallback_provider` | agnes / mimo / mimo | 常规 / 批量 / 降级后端 |
+| `provider` | `agnes` | 常规后端 |
+| `batch_provider` | `mimo` | 批量后端（超过阈值时） |
+| `fallback_provider` | `mimo` | 常规/批量失败后的降级后端 |
 | `batch_threshold` | 3 | 超过此张数视为批量 |
-| `recognition_time_budget` | 900 | 单轮识别时间预算（秒）；预算内一次识别全部图片，超出（极端数量）则进度续传 |
-| `results_max_age_days` | 7 | 完整识别落盘（results/）保留天数，过期自动清理 |
-| `state_max_age_days` | 30 | state 记账保留天数（防重复语义过期即清），防无限增长 |
-| `state_cleanup_interval_hours` | 24 | 自动清理执行间隔（小时） |
-| `per_image_max_chars` / `total_max_chars` | 2000 / 8000 | 注入长度上限（识别不受限；超限落盘见"使用"） |
-| `max_image_bytes` | 10485760 | 大小提示阈值（超过仍尽力识别，不跳过） |
-| `timeout_seconds` | 90 | 单次 API 超时 |
-| `max_tokens` | 4000 | 识别输出 token 上限 |
-| `log_max_bytes` | 1048576 | 日志轮转阈值（归档为 `.log.1`，保留最近两段） |
-| `skip_when_multimodal` | false | 主模型原生多模态时设 true：跳过识别注入，图片走原生通道（或 `VISION_SKIP_MULTIMODAL=1`） |
-| `update_check_interval_hours` | 24 | 版本自检间隔（小时）；0 = 禁用自检 |
+| `max_images` | 4 | 单次最多识别张数（超出部分注入时注明） |
+| `per_image_max_chars` / `total_max_chars` | 800 / 4000 | 单张/总注入长度上限 |
+| `session_db_path` | 由 artifacts_dir 推导 | 会话 DB 路径（`input_history` 权威信号来源；默认 `~/.zcode/cli/db/db.sqlite`） |
+| `fresh_seconds` | 300 | DB 不可用时的兜底扫描新鲜度窗口（秒） |
 
-### Provider
+批量行为：每张图独立调用、**串行**执行（避免撞免费后端并发限流），结果合并注入
+（`图1: ... 图2: ...`）。批量最坏耗时 ≈ 张数 × 单张耗时（mimo 约 40s/张），
+hook 超时已放宽到 5 分钟。嫌慢可调低 `max_images` 或把 `batch_provider` 设为 `zhipu`。
+
+Provider 说明：
 
 | provider | 后端 | 说明 |
 |---|---|---|
-| `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | **推荐**：免费聚合后端 |
-| `zhipu` | 免费 GLM-4.6V-Flash（bigmodel.cn） | 国内用户可注册；免费、快；有免费限流 |
-| `mimo` | 小米 MiMo-V2.5（经 opencode Go 网关） | 质量高但较慢；消耗套餐配额。👉 [通过推荐链接使用 opencode Go](https://opencode.ai/go?ref=RKEAQV3NAW) |
+| `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | 当前默认、免费 |
+| `zhipu` | 免费 GLM-4.6V-Flash | 备选（config.example 示例，本机当前未配置） |
+| `mimo` | 小米 MiMo-V2.5（经 opencode Go 网关） | 质量高但较慢；消耗套餐配额；批量/降级默认 |
 | `mimo-direct` | 小米官方 API（api.xiaomimimo.com） | 备用；需 platform.xiaomimimo.com 的 key |
 
-OpenAI 兼容 `/chat/completions`，可自行添加任意提供商。`VISION_CONFIG=/path/config.json` 指定配置文件（测试用）。`mimo-v2.5` 支持图片，`mimo-v2.5-pro` 不支持。
+注意：
+- `mimo-v2.5` 才支持图片，`mimo-v2.5-pro` 不支持。
+- 2026-08-01 实测：opencode Go 网关识图（mimo-v2.5）可用。该网关历史上对多模态
+  图片输入有 HTTP 500 问题（GitHub issue #33942），如再次出现请切换 `zhipu` 或 `mimo-direct`。
 
-### 目录结构
+## 批量识别文件夹（数十张图）
 
+交互式贴图适合 1~5 张。**几十张图请用命令行批量模式**，结果写文件、不占对话上下文：
+
+```bash
+# 扫描目录下所有图片（递归），结果写入 results.md
+python vision_hook.py --folder "D:/图片目录" --out "D:/图片目录/results.md"
+
+# 指定文件列表
+python vision_hook.py --files a.png b.png c.png --out results.md
+
+# 强制某 provider / 限量
+python vision_hook.py --folder "D:/图片目录" --provider mimo --max 20 --out results.md
 ```
-deepseek-vision-helper/
-├── skills/deepseek-vision-helper/SKILL.md   # skill：指导模型使用注入的识别结果
-└── hook/
-    ├── vision_hook.py                       # Hook 脚本（Python 3，仅标准库）
-    └── config.example.json                  # 配置示例（复制为 config.json 填 key）
+
+- 路由与 hook 完全一致：≤3 张走默认 provider（agnes），>3 张走 mimo，失败自动降级（`--provider` 可强制）
+- 支持 png/jpg/jpeg/webp/gif/bmp；串行执行，每张独立调用
+- **在对话里直接说**："识别 D:/xxx 下所有图片，结果存到 results.md"——DeepSeek 会自己调用这个脚本，再读文件帮你汇总，几十张图也不怕
+- `--out` 建议必填：结果落盘后模型按需读取，避免把几十段描述灌进上下文
+
+## 故障排查
+
+1. **完全不生效**：查看 `vision_hook.log` 是否有 `hook fired`；没有说明 hook 没被调用
+   （检查 `~/.zcode/cli/config.json` 的 `hooks.enabled: true`）。
+2. **`no image found`**：日志里看是"无附件提交"还是"权威信号缺失走兜底"。如果确认贴了图
+   且日志显示 `session db not found`，检查 `session_db_path` 配置（默认由 `artifacts_dir`
+   推导为 `~/.zcode/cli/db/db.sqlite`）；显示 `no input_history row for session` 说明
+   hook 触发早于记录写入（极罕见，ZCode 实测早约 1s 写入）。
+3. **`vision api failed`**：看具体错误；`1305` 是平台过载，稍后重试即可；401 是 key 无效。
+4. **Hook 没跑起来但配置正确**：用下面的命令手动测脚本。
+
+### 手动测试
+
+```bash
+# 无图场景（应无输出、退出码 0）
+echo '{"hook_event_name":"UserPromptSubmit","session_id":"x","transcript_path":"不存在的文件","prompt":"hi"}' \
+  | "/c/Users/JiangLiu/AppData/Roaming/uv/python/cpython-3.12-windows-x86_64-none/python.exe" \
+  "C:/Users/JiangLiu/.zcode/vision-hook/vision_hook.py"
 ```
 
-运行时自动生成：`vision_hook_state.json`（已识别记账）、`vision_hook.log`（调试日志）、`results/`（超限时的完整识别结果）——均不含密钥。
+### 备选：只用 PreToolUse 事件（不推荐）
 
-### 安全提醒
+识别以 `UserPromptSubmit` 为唯一触发（提交级附件识别）；`PreToolUse` 只做预算截断的
+续传，不再扫描新附件（防止"贴在输入框还没发"的图被提前识别——旧图混入的根源之一）。
+请保持配置中 `UserPromptSubmit` 注册，不要只挂 `PreToolUse`。
 
-- API key 只存本机 `config.json` 或环境变量；仓库 `.gitignore` 已排除 config/state/log/results
-- 本仓库只含 `config.example.json` 占位配置，无任何真实密钥
-- key 曾在聊天/日志泄露过 → 到对应平台控制台重置
+## 安全提醒
 
----
-
-## 许可证
-
-MIT License，见 [LICENSE](LICENSE)。
+- key 只存在本机 `config.json`；不要在聊天中明文发送、不要提交到任何仓库。
+- 若 key 曾在聊天/日志中泄露过，建议到 bigmodel.cn 控制台重置。

@@ -34,6 +34,7 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             req = {"_raw": body}
         self.api.requests.append(req)
+        self._last_req = req
 
         mode = self.api.mode
         if mode == "fail500":
@@ -54,8 +55,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, self._ok_payload())
 
     def _ok_payload(self):
+        if getattr(self.api, "echo", False):
+            # 回声模式: 响应里带图片指纹(md5 of image_url), 便于断言"识别了哪张图"
+            img_url = ""
+            try:
+                content = self._last_req["messages"][-1]["content"]
+                for part in content if isinstance(content, list) else []:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        img_url = part["image_url"]["url"] or ""
+            except Exception:
+                img_url = ""
+            import hashlib
+            fp = hashlib.md5(img_url.encode("utf-8")).hexdigest()[:12]
+            content = "识别结果(图指纹:%s)" % fp
+        else:
+            content = FAKE_OK_TEXT
         return {
-            "choices": [{"message": {"content": FAKE_OK_TEXT}, "index": 0}],
+            "choices": [{"message": {"content": content}, "index": 0}],
             "model": "mock-vision",
         }
 

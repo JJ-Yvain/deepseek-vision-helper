@@ -12,6 +12,8 @@
 | L1 模糊 | `test_fuzz.py` | 畸形/边界输入轰炸:空 payload、非 JSON、千张附件、超长文件名 | 秒级/免费 |
 | L2 故障注入 | `test_fault_injection.py` | mock API 注入 500/429/401/畸形/超时,验证降级链、重试、建议物理隔离 | 秒级/免费 |
 | 攻击集 | `test_adversarial.py` | 针对已知弱点定向攻击:建议泄漏、旧图混入、轮次混淆、多图轰炸、边界 | 秒级/免费 |
+| 残图攻击集 | `test_stale_attachment.py` | 贴错图→删图→换图→提交,从未发送的旧图不得注入;含纯文本残留/续传/兜底新鲜度 | 秒级/免费 |
+| MCP 通道 | `test_mcp_server.py` | MCP 协议握手/帧格式/工具契约/识别功能/错误处理/批量,模型主动调用通道的契约 | 秒级/免费 |
 | 集成(真实 API) | `test_regression.py` | 8 项关键路径回归(真实视觉 API) | 分钟级/花钱 |
 | 多轮模拟(真实 API) | `test_multi_round.py` | 轮次隔离、时间戳递增、state 无累积 | 分钟级/花钱 |
 | 交接质量(真 DeepSeek) | `test_handoff.py` | 真正的 DeepSeek 作为主模型:最新轮/历史轮/图号/相似不混淆 | 分钟级/花钱 |
@@ -48,3 +50,6 @@ python <单个测试文件>.py     # 单独运行
 
 - L1 模糊:非 dict payload(JSON 数组)导致 hook 崩溃 → 已修复(类型防御)
 - 测试自身:session 路径拼接误解、Windows 文件名长度限制、重复 put 导致 mtime 变化
+- 残图攻击集:贴错图→删图→换图→提交,旧图(从未发送)被识别注入 → 已修复
+  (以 input_history.attachments 为权威信号,只识别实际提交的附件;详见
+  `docs/capabilities/deepseek-vision-helper.md` 迭代记录)
